@@ -1,0 +1,2 @@
+[env]
+TSLP_LANGUAGES = "asm,bash,c,cpp,csharp,css,dart,dockerfile,go,groovy,html,javascript,json,make,markdown,nasm,python,rust,sql,swift,toml,tsx,typescript,yaml"

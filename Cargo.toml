@@ -1,0 +1,73 @@
+[package]
+name = "acodeeditor"
+version = "0.1.0"
+edition = "2024"
+authors = ["stubbornmarlin3"]
+description = "ACodeEditor — TUI code editor / dev environment"
+license = "MIT"
+repository = "https://github.com/stubbornmarlin3/ACodeEditor"
+homepage = "https://github.com/stubbornmarlin3/ACodeEditor"
+readme = "README.md"
+
+[[bin]]
+name = "ace"
+path = "src/main.rs"
+
+[dependencies]
+ratatui      = "0.29"
+crossterm    = "0.28"
+anyhow       = "1"
+portable-pty = "0.9"
+vt100        = "0.15"
+tui-textarea = { version = "0.7", features = ["search"] }
+git2         = { version = "0.19", default-features = false }
+notify       = "6"
+similar      = "2"
+arboard      = "3"
+unicode-width = "0.2"
+
+# Syntax highlighting — individual grammar crates ship their own queries;
+# the language-pack crate (download feature off) is kept purely for its
+# 305-extension → language-name map used by detect_language_from_extension.
+tree-sitter           = "0.26"
+tree-sitter-highlight = "0.26"
+tree-sitter-language-pack = { version = "1", default-features = false }
+
+# Grammar crates — one per language, each bundles parser + queries statically.
+tree-sitter-asm        = "0.24"
+tree-sitter-bash       = "0.25"
+tree-sitter-c          = "0.24"
+tree-sitter-c-sharp    = "0.23.5"
+tree-sitter-cpp        = "0.23"
+tree-sitter-css        = "0.25"
+tree-sitter-dart       = "0.1"
+# Upstream `tree-sitter-dockerfile` pins tree-sitter ~0.20, which is ABI-
+# incompatible with the 0.26 everything else uses. The `-updated` fork
+# loosens the pin to >=0.21 without otherwise changing the API.
+tree-sitter-dockerfile = { package = "tree-sitter-dockerfile-updated", version = "0.2" }
+tree-sitter-go         = "0.25"
+tree-sitter-haskell    = "0.23"
+tree-sitter-html       = "0.23"
+tree-sitter-java       = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-json       = "0.24"
+tree-sitter-lua        = "0.5"
+tree-sitter-make       = "1.1.1"
+tree-sitter-md         = "0.5"
+tree-sitter-nix        = "0.3"
+tree-sitter-php        = "0.24"
+tree-sitter-python     = "0.25"
+tree-sitter-regex      = "0.25"
+tree-sitter-ruby       = "0.23"
+tree-sitter-rust       = "0.24"
+tree-sitter-sequel     = "0.3"
+tree-sitter-swift      = "0.7"
+tree-sitter-toml-ng    = "0.7"
+tree-sitter-typescript = "0.23"
+tree-sitter-yaml       = "0.7"
+tree-sitter-zig        = "1.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
