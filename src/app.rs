@@ -2467,10 +2467,14 @@ impl App {
     }
 
     /// Write `.acedata` into the active project's root. No-op when no
-    /// project is active (files-only session, or empty list).
-    pub fn persist_cells(&self) {
+    /// project is active (files-only session, or empty list). Also
+    /// refreshes `last_saved_hash` so the next `persist_cells_if_dirty`
+    /// tick doesn't rewrite the file we just wrote.
+    pub fn persist_cells(&mut self) {
         let Some(root) = self.current_project_root() else { return; };
-        let _ = crate::session_state::save(&root, &self.acedata_snapshot());
+        let snap = self.acedata_snapshot();
+        let _ = crate::session_state::save(&root, &snap);
+        self.last_saved_hash = hash_snapshot(&snap);
         // Gitignore injection happens alongside persistence so users
         // don't commit their session state by accident. Guarded by
         // `.acerc auto_gitignore = false` if they want to opt out.
@@ -2513,6 +2517,10 @@ impl App {
     /// restored — `0` means the caller should fall back to a scratch
     /// editor.
     pub fn restore_cells_from_snapshot(&mut self, snap: &StateSnapshot) -> usize {
+        // Seed the dirty-check hash with the on-disk snapshot we're
+        // restoring from. Otherwise the very first `persist_cells_if_dirty`
+        // tick sees hash 0 ≠ current and rewrites `.acedata` identically.
+        self.last_saved_hash = hash_snapshot(snap);
         const DEFAULT_ROWS: u16 = 24;
         const DEFAULT_COLS: u16 = 80;
         let mut restored = 0;

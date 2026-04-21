@@ -43,6 +43,7 @@ pub struct Completion {
 /// order, so put the common ones first. (We sort before returning, so
 /// this really is just a listing — filtering still happens.)
 const TOP_LEVEL: &[&str] = &[
+    "c", "claude",
     "close", "bd", "bdelete",
     "conflict", "resolve",
     "edit", "edit!", "e", "e!",
@@ -56,6 +57,7 @@ const TOP_LEVEL: &[&str] = &[
     "set",
     "min", "minimize",
     "restore",
+    "s", "shell",
     "split",
     "sudo",
     "swap",
@@ -224,12 +226,17 @@ fn starts_with_into(all: &[&str], prefix: &str, start: usize) -> Completion {
 fn path_options(token: &str, cwd: &Path, files_only: bool) -> Vec<String> {
     let (dir_part, leaf_prefix) = split_path_token(token);
 
-    let dir_path = if dir_part.is_empty() {
+    // `~` / `~/…` in the directory portion resolves against the user's
+    // home directory so completion mirrors what the command will do when
+    // it runs (see `app::expand_tilde`). The returned options keep the
+    // `~` prefix verbatim so the user's input shape is preserved.
+    let expanded = expand_tilde_for_completion(dir_part);
+    let dir_path = if expanded.is_empty() {
         cwd.to_path_buf()
-    } else if Path::new(dir_part).is_absolute() {
-        Path::new(dir_part).to_path_buf()
+    } else if Path::new(&expanded).is_absolute() {
+        Path::new(&expanded).to_path_buf()
     } else {
-        cwd.join(dir_part)
+        cwd.join(&expanded)
     };
 
     let Ok(rd) = std::fs::read_dir(&dir_path) else {
@@ -258,6 +265,31 @@ fn path_options(token: &str, cwd: &Path, files_only: bool) -> Vec<String> {
         b.0.cmp(&a.0).then_with(|| a.1.to_ascii_lowercase().cmp(&b.1.to_ascii_lowercase()))
     });
     out.into_iter().map(|(_, s)| s).collect()
+}
+
+/// Resolve a leading `~` / `~/` / `~\` in the directory portion of a
+/// path token. Falls back to the raw string when no home dir is set, so
+/// completion degrades gracefully instead of silently listing `cwd`.
+fn expand_tilde_for_completion(dir_part: &str) -> String {
+    if dir_part == "~" {
+        if let Some(h) = home_dir_str() {
+            return h;
+        }
+        return dir_part.to_string();
+    }
+    if let Some(rest) = dir_part.strip_prefix("~/").or_else(|| dir_part.strip_prefix("~\\")) {
+        if let Some(h) = home_dir_str() {
+            let sep = if cfg!(windows) { '\\' } else { '/' };
+            return format!("{h}{sep}{rest}");
+        }
+    }
+    dir_part.to_string()
+}
+
+fn home_dir_str() -> Option<String> {
+    std::env::var("HOME").ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())
+        .filter(|s| !s.is_empty())
 }
 
 /// Split a path-ish token into `(dir_part_including_trailing_sep, leaf_prefix)`.

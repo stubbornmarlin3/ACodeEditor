@@ -274,7 +274,15 @@ fn draw_cell(frame: &mut Frame, area: Rect, cell_idx: usize, app: &App) {
     let project_root = app.projects.projects
         .get(app.projects.active)
         .map(|p| p.root.as_path());
-    let left_title  = cell_title_line(cell, project_root, area.width, focused, t);
+    let active_title_style = if focused {
+        // Match the border tint so the whole focused cell reads in one
+        // colour per mode (green in Insert, magenta in Visual, accent
+        // otherwise) — no split between title and border.
+        cell_mode_border_style(app)
+    } else {
+        t.title_unfocused()
+    };
+    let left_title  = cell_title_line(cell, project_root, area.width, focused, t, active_title_style);
     // Right-hand digit hint: shown only while Space has armed a jump,
     // so users can see which digit targets which cell. Cells are 1..9
     // (cell index 0 → `1`, …, index 8 → `9`); Explorer panel is 0.
@@ -942,8 +950,8 @@ fn draw_diff_lines(frame: &mut Frame, area: Rect, view: &crate::diff::DiffView, 
 /// focused tab and others dimmed. If the full tab strip won't fit in
 /// the available width, collapse to `{active} N/M`. A `[↑N]` suffix
 /// appears when the active PTY is scrolled back through its history.
-fn cell_title_line(cell: &Cell, project_root: Option<&Path>, width: u16, focused: bool, t: &Theme) -> Line<'static> {
-    let active_style   = if focused { t.title_focused() } else { t.title_unfocused() };
+fn cell_title_line(cell: &Cell, project_root: Option<&Path>, width: u16, focused: bool, t: &Theme, active_style: Style) -> Line<'static> {
+    let _ = focused;
     let inactive_style = Style::default().fg(t.dim);
     let sep_style      = Style::default().fg(t.dim);
     let sb_style       = Style::default().fg(t.warn);
