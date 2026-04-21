@@ -41,6 +41,7 @@ fn main() -> Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         ratatui::restore();
+        reset_terminal_title();
         default_hook(info);
     }));
 
@@ -70,6 +71,7 @@ fn main() -> Result<()> {
         run(&mut terminal, &mut app, &rx)
     }));
     ratatui::restore();
+    reset_terminal_title();
     // Final persistence runs regardless of how `run()` returned — clean
     // quit, channel hangup, I/O error, or panic. Skips silently for
     // rootless (files-only) sessions.
@@ -230,34 +232,54 @@ fn run_update(tag: Option<&str>) {
     eprintln!("ace: updating to {label} via {os_name} installer…");
     eprintln!("     {url}");
 
-    let status = if cfg!(target_os = "windows") {
-        std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-ExecutionPolicy", "Bypass",
-                "-Command",
-                &format!("irm {url} | iex"),
-            ])
-            .status()
-    } else {
-        // sh -c lets us compose a pipeline; prefer curl (common) and
-        // fall back to wget if that's not available.
-        let cmd = format!(
-            "curl --proto '=https' --tlsv1.2 -LsSf {url} | sh \
-             || (wget -qO- {url} | sh)"
+    // The installer overwrites this very binary. If we `status()` and
+    // wait, the running ace.exe holds a lock on its own image and the
+    // installer's rename fails on Windows. Spawn the installer detached
+    // with a small leading delay, then return so main() exits and the
+    // OS releases the file handle before the installer writes.
+    let spawn_result = if cfg!(target_os = "windows") {
+        // Launch in a new PowerShell window so the installer's output
+        // isn't mashed into the shell prompt that'll reappear as soon
+        // as ace exits. The outer PowerShell just fires Start-Process
+        // and returns — the inner one does the work and pauses at the
+        // end so the user sees the result.
+        let inner = format!(
+            "Start-Sleep -Seconds 2; try {{ irm {url} | iex }} \
+             catch {{ Write-Host \"ace: installer failed: $_\" -ForegroundColor Red }}; \
+             Write-Host ''; Write-Host 'Press Enter to close.'; \
+             [void][System.Console]::ReadLine()"
         );
-        std::process::Command::new("sh")
-            .args(["-c", &cmd])
-            .status()
+        // Base64-encode the inner command to avoid quoting pain when
+        // passing it through Start-Process -ArgumentList.
+        let utf16: Vec<u8> = inner.encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        let encoded = base64_encode(&utf16);
+        let outer = format!(
+            "Start-Process powershell -ArgumentList \
+             '-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand','{encoded}'"
+        );
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &outer])
+            .spawn()
+    } else {
+        // sh -c composes the pipeline; the leading sleep gives ace time
+        // to exit before the installer's rename. Prefer curl, fall back
+        // to wget. setsid detaches from our controlling terminal so the
+        // installer survives even if this process' tty goes away.
+        let cmd = format!(
+            "sleep 1; curl --proto '=https' --tlsv1.2 -LsSf {url} | sh \
+             || wget -qO- {url} | sh"
+        );
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", &cmd]);
+        c.spawn()
     };
 
-    match status {
-        Ok(s) if s.success() => {
-            eprintln!("ace: update complete.");
-        }
-        Ok(s) => {
-            eprintln!("ace: update failed (installer exited with {s}).");
-            std::process::exit(1);
+    match spawn_result {
+        Ok(_) => {
+            eprintln!("ace: installer launched in a detached process.");
+            eprintln!("ace: exiting now so the binary can be replaced.");
         }
         Err(e) => {
             eprintln!("ace: update failed to launch installer: {e}");
@@ -265,6 +287,32 @@ fn run_update(tag: Option<&str>) {
             std::process::exit(1);
         }
     }
+}
+
+/// Minimal base64 (standard alphabet, padded) — used only for packing
+/// the PowerShell `-EncodedCommand` payload. Avoids pulling in a crate
+/// for a handful of bytes.
+fn base64_encode(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(A[(b0 >> 2) as usize] as char);
+        out.push(A[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(A[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(A[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }
 
 fn current_term_rect() -> Rect {
@@ -428,6 +476,17 @@ fn update_terminal_title(app: &App, last: &mut String) {
     let _ = stdout.write_all(seq.as_bytes());
     let _ = stdout.flush();
     *last = desired;
+}
+
+/// Clear the OSC 2 window title we set while running. Most terminals
+/// fall back to their default title (shell / tab profile) when they
+/// receive an empty title string — without this, the terminal would
+/// stay stamped with "Ace | …" after ace exits.
+fn reset_terminal_title() {
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(b"\x1b]2;\x07");
+    let _ = stdout.flush();
 }
 
 /// Human-readable label for the currently-focused element: editor file
