@@ -46,6 +46,11 @@ pub struct Config {
     /// (`master-bottom|mb`, `master-right|mr`, plus the alias
     /// `master-stack|ms` for back-compat).
     pub layout:                  Option<String>,
+    /// Whether `.acedata` and `.acerc` are auto-added to a project's
+    /// `.gitignore` on first switch. `None` / `true` → inject; `false` →
+    /// leave the user's gitignore alone. Matches the common case where
+    /// session data isn't something you want tracked.
+    pub auto_gitignore:          Option<bool>,
 }
 
 impl Config {
@@ -78,6 +83,9 @@ impl Config {
         if other.layout.is_some() {
             self.layout = other.layout;
         }
+        if other.auto_gitignore.is_some() {
+            self.auto_gitignore = other.auto_gitignore;
+        }
     }
 }
 
@@ -99,6 +107,7 @@ fn parse(content: &str) -> Config {
             "claude_skip_permissions" => c.claude_skip_permissions = parse_bool(raw_value),
             "on_launch" => c.on_launch = Some(strip_outer_quotes(raw_value.trim()).trim().to_string()),
             "layout"    => c.layout    = Some(strip_outer_quotes(raw_value.trim()).trim().to_string()),
+            "auto_gitignore" => c.auto_gitignore = parse_bool(raw_value),
             _ => {}
         }
     }

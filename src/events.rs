@@ -28,11 +28,21 @@ pub enum AppEvent {
 
 /// Forward crossterm events into the app channel. Thread ends when the
 /// receiver drops `tx`.
+///
+/// Filters out events we don't consume (mouse, focus gain/lost, paste)
+/// at the source — some terminals (notably Windows Terminal) flush a
+/// burst of focus/mouse events on tab refocus, and every queued event
+/// costs a wake + redraw downstream. Only keys and resizes reach the
+/// app loop.
 pub fn start_input_thread(tx: Sender<AppEvent>) {
     thread::spawn(move || {
         loop {
             match event::read() {
                 Ok(ev) => {
+                    let keep = matches!(ev, Event::Key(_) | Event::Resize(_, _));
+                    if !keep {
+                        continue;
+                    }
                     if tx.send(AppEvent::Input(ev)).is_err() {
                         break;
                     }

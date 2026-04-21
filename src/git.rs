@@ -119,6 +119,12 @@ pub struct GitSnapshot {
     /// something to do.
     pub stash_count:   u32,
     statuses:          HashMap<String, Status>,
+    /// Precomputed worst-status-wins aggregate per ancestor directory,
+    /// keyed by forward-slash rel path ("" for the workdir root). Built
+    /// once in `load()` so `dir_status()` is O(1) during render — the
+    /// previous linear scan of `statuses` per folder per frame was a
+    /// real bottleneck on large repos.
+    dir_statuses:      HashMap<String, FileStatus>,
 }
 
 impl GitSnapshot {
@@ -137,6 +143,7 @@ impl GitSnapshot {
             op_state:     RepoOpState::Clean,
             stash_count:  0,
             statuses:     HashMap::new(),
+            dir_statuses: HashMap::new(),
         }
     }
 
@@ -204,11 +211,13 @@ impl GitSnapshot {
         let branches = list_branches(&repo, &branch);
         let op_state = classify_op_state(repo.state());
         let stash_count = count_stashes(&mut repo);
+        let dir_statuses = build_dir_statuses(&statuses);
 
         Self {
             branch,
             ahead, behind, staged, modified, untracked, conflicts,
-            workdir, branches, has_upstream, op_state, stash_count, statuses,
+            workdir, branches, has_upstream, op_state, stash_count,
+            statuses, dir_statuses,
         }
     }
 
@@ -306,32 +315,43 @@ impl GitSnapshot {
 
     /// Aggregated status for a directory: the "worst" classification
     /// among any tracked child (recursive). Used to tint folders in the
-    /// file tree the same way files are tinted.
+    /// file tree. O(1) via a precomputed index built in `load()`.
     pub fn dir_status(&self, abs_dir: &Path) -> Option<FileStatus> {
         let wd  = self.workdir.as_ref()?;
         let rel = abs_dir.strip_prefix(wd).ok()?;
         let rel_slash = rel.to_string_lossy().replace('\\', "/");
-        let prefix = if rel_slash.is_empty() {
-            String::new()
-        } else {
-            format!("{rel_slash}/")
-        };
-
-        let mut worst: Option<FileStatus> = None;
-        for (path, flags) in &self.statuses {
-            if !prefix.is_empty() && !path.starts_with(&prefix) {
-                continue;
-            }
-            let s = classify_tree(*flags);
-            worst = Some(match worst {
-                None                              => s,
-                Some(w) if s.priority() < w.priority() => s,
-                Some(w)                           => w,
-            });
-        }
-        worst
+        self.dir_statuses.get(rel_slash.as_str()).copied()
     }
 
+}
+
+/// Walk every status entry once and bubble its classification up through
+/// each ancestor directory, keeping the worst-priority status at each
+/// level. The workdir root lives at the empty-string key.
+fn build_dir_statuses(statuses: &HashMap<String, Status>) -> HashMap<String, FileStatus> {
+    let mut out: HashMap<String, FileStatus> = HashMap::new();
+    for (path, flags) in statuses {
+        let s = classify_tree(*flags);
+        // The file's own parent chain: for "a/b/c.txt" that's "a/b", "a", "".
+        let mut cursor = path.as_str();
+        loop {
+            let parent = match cursor.rfind('/') {
+                Some(i) => &cursor[..i],
+                None    => "",
+            };
+            merge_dir_status(&mut out, parent, s);
+            if parent.is_empty() { break; }
+            cursor = parent;
+        }
+    }
+    out
+}
+
+fn merge_dir_status(map: &mut HashMap<String, FileStatus>, key: &str, s: FileStatus) {
+    match map.get(key).copied() {
+        Some(w) if w.priority() <= s.priority() => {}
+        _ => { map.insert(key.to_string(), s); }
+    }
 }
 
 /// Per-file classification for sidebar tinting. Order of checks

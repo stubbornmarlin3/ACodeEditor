@@ -12,6 +12,13 @@ pub struct Theme {
     pub info:    Color,
     pub err:     Color,
     pub muted:   Color,
+    /// Bright magenta — reserved for the Visual-mode border tint so the
+    /// focused cell clearly reads as "selection is live".
+    pub magenta: Color,
+    /// Violet / purple — used for the explorer's GitBranches sub-mode
+    /// border so it's distinct from GitOverview (green) and GitChanges
+    /// (orange).
+    pub purple:  Color,
 }
 
 impl Theme {
@@ -28,11 +35,9 @@ impl Theme {
             info:   Color::Rgb(0x6a, 0x9c, 0xff),
             err:    Color::Rgb(0xe5, 0x6a, 0x6a),
             muted:  Color::Rgb(0x4b, 0x50, 0x5c),
+            magenta: Color::Rgb(0xff, 0x5a, 0xff),
+            purple:  Color::Rgb(0xb4, 0x7c, 0xff),
         }
-    }
-
-    pub fn border_focused(&self) -> Style {
-        Style::default().fg(self.accent).add_modifier(Modifier::BOLD)
     }
 
     pub fn border_unfocused(&self) -> Style {

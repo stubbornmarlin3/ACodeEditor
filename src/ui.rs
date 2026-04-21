@@ -146,7 +146,17 @@ fn compute_explorer_width(area: Rect, app: &App) -> u16 {
                             // `[NEW]` renders for on-disk-missing
                             // buffers — same shape as PTY badges, so
                             // size it in.
-                            let badge_w = if ed.is_new { 1 + "[NEW]".len() } else { 0 };
+                            use crate::editor::ExternalConflict as C;
+                            let mut badge_w = if ed.is_new {
+                                1 + "[NEW]".len()
+                            } else if ed.external_conflict == Some(C::ModifiedOnDisk) {
+                                1 + "[CONFLICT]".len()
+                            } else {
+                                0
+                            };
+                            if ed.external_conflict == Some(C::Deleted) {
+                                badge_w += 1 + "[DELETED]".len();
+                            }
                             (ed.file_name().chars().count(), badge_w, ext)
                         }
                     }
@@ -254,7 +264,11 @@ fn draw_cell(frame: &mut Frame, area: Rect, cell_idx: usize, app: &App) {
     let t = &app.theme;
     let focused = app.focus == FocusId::Cell(cell_idx);
     let border_set   = if focused { border::THICK } else { border::PLAIN };
-    let border_style = if focused { t.border_focused() } else { t.border_unfocused() };
+    let border_style = if focused {
+        cell_mode_border_style(app)
+    } else {
+        t.border_unfocused()
+    };
 
     let cell = &app.cells[cell_idx];
     let project_root = app.projects.projects
@@ -933,7 +947,9 @@ fn cell_title_line(cell: &Cell, project_root: Option<&Path>, width: u16, focused
     let inactive_style = Style::default().fg(t.dim);
     let sep_style      = Style::default().fg(t.dim);
     let sb_style       = Style::default().fg(t.warn);
-    let ext_style      = Style::default().fg(t.info).add_modifier(Modifier::BOLD);
+    // Match the [CLAUDE]/[SHELL] badge colour (t.warn) so all
+    // title-row badges share the same visual language.
+    let ext_style      = Style::default().fg(t.warn).add_modifier(Modifier::BOLD);
     let scroll_suffix  = scrollback_suffix(cell.active_session());
 
     // Whether the active editor's file is outside the active project —
@@ -944,6 +960,8 @@ fn cell_title_line(cell: &Cell, project_root: Option<&Path>, width: u16, focused
     let parts: Vec<(String, Option<&'static str>)> =
         cell.sessions.iter().map(cell_tab_parts).collect();
 
+    let deleted_badge = session_deleted_badge(cell.active_session());
+
     if cell.sessions.len() == 1 {
         let (label, badge) = &parts[0];
         let mut spans = vec![
@@ -951,6 +969,9 @@ fn cell_title_line(cell: &Cell, project_root: Option<&Path>, width: u16, focused
             Span::styled(label.clone(), active_style),
         ];
         if let Some(b) = badge {
+            spans.push(Span::styled(format!(" {b}"), badge_style_for(t, b)));
+        }
+        if let Some(b) = deleted_badge {
             spans.push(Span::styled(format!(" {b}"), badge_style_for(t, b)));
         }
         if is_external {
@@ -984,8 +1005,13 @@ fn cell_title_line(cell: &Cell, project_root: Option<&Path>, width: u16, focused
                 let bs = if i == cell.active { badge_style_for(t, b) } else { inactive_style };
                 spans.push(Span::styled(format!(" {b}"), bs));
             }
-            if i == cell.active && is_external {
-                spans.push(Span::styled(" [EXTERNAL]", ext_style));
+            if i == cell.active {
+                if let Some(b) = deleted_badge {
+                    spans.push(Span::styled(format!(" {b}"), badge_style_for(t, b)));
+                }
+                if is_external {
+                    spans.push(Span::styled(" [EXTERNAL]", ext_style));
+                }
             }
         }
         if let Some(sfx) = scroll_suffix {
@@ -1000,6 +1026,9 @@ fn cell_title_line(cell: &Cell, project_root: Option<&Path>, width: u16, focused
             Span::styled(label.clone(), active_style),
         ];
         if let Some(b) = badge {
+            spans.push(Span::styled(format!(" {b}"), badge_style_for(t, b)));
+        }
+        if let Some(b) = deleted_badge {
             spans.push(Span::styled(format!(" {b}"), badge_style_for(t, b)));
         }
         if is_external {
@@ -1029,6 +1058,36 @@ fn is_editor_external(sess: &Session, project_root: Option<&Path>) -> bool {
     !path.starts_with(root)
 }
 
+/// Border tint for the focused cell, keyed off the current outer mode.
+/// Insert lights up green, Visual goes magenta, Command stays on the
+/// cyan accent (no separate tint — the CMD badge in the statusbar is
+/// already unmistakable). Normal / default → accent.
+fn cell_mode_border_style(app: &App) -> Style {
+    let t = &app.theme;
+    let color = match &app.mode {
+        Mode::Insert       => t.ok,
+        Mode::Visual { .. }=> t.magenta,
+        _                  => t.accent,
+    };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+/// Border tint for the focused explorer. GitOverview/GitLog → green,
+/// GitBranches → purple, GitChanges → orange. Normal → accent (default
+/// cyan). Matches the user's colour mapping so the border alone tells
+/// you which sub-mode is live.
+fn explorer_mode_border_style(app: &App) -> Style {
+    let t = &app.theme;
+    let color = match app.explorer_mode {
+        ExplorerMode::Normal       => t.accent,
+        ExplorerMode::GitOverview  => t.ok,
+        ExplorerMode::GitLog       => t.ok,
+        ExplorerMode::GitBranches  => t.purple,
+        ExplorerMode::GitChanges   => t.warn,
+    };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
 /// Colour for a per-session kind badge (`[CLAUDE]`, `[SHELL]`,
 /// `[ACodeEditor]`, `[NEW]`). Each badge gets a distinct hue so a
 /// glance at the tab strip tells you what you're looking at.
@@ -1038,9 +1097,23 @@ fn badge_style_for(t: &Theme, badge: &str) -> Style {
         "[SHELL]"       => t.warn,
         "[ACodeEditor]" => Color::Rgb(0xc7, 0x8e, 0xff),
         "[NEW]"         => t.ok,
+        // External-disk state — red + bold so the title row screams
+        // at the user when disk content diverged ("[CONFLICT]") or
+        // the file vanished behind them ("[DELETED]").
+        "[DELETED]" | "[CONFLICT]" => t.err,
         _               => t.accent,
     };
     Style::default().fg(c).add_modifier(Modifier::BOLD)
+}
+
+/// Returns `Some("[DELETED]")` when this session is an editor whose
+/// on-disk file has been removed externally. `None` otherwise.
+fn session_deleted_badge(s: &Session) -> Option<&'static str> {
+    use crate::editor::ExternalConflict as C;
+    match s {
+        Session::Edit(ed) if ed.external_conflict == Some(C::Deleted) => Some("[DELETED]"),
+        _ => None,
+    }
 }
 
 /// `" [↑12]"` when the active PTY is scrolled back 12 lines. `None` for
@@ -1092,16 +1165,22 @@ fn cell_tab_parts(s: &Session) -> (String, Option<&'static str>) {
                 return (format!("unknown{dirty}"), Some("[NEW]"));
             }
             let name = ed.file_name();
-            let conflict = match ed.external_conflict {
-                Some(C::ModifiedOnDisk) => "⚠",
-                Some(C::Deleted)        => "✗",
-                None                    => "",
-            };
             let dirty = if ed.dirty { "*" } else { "" };
-            // File with a path but not-yet-on-disk → carry the [NEW]
-            // badge so `:w` vs. overwrite is obvious.
-            let badge = if ed.is_new { Some("[NEW]") } else { None };
-            (format!("{name}{dirty}{conflict}"), badge)
+            // External-disk states carry a dedicated red badge so the
+            // condition reads as loud as it warrants:
+            //   ModifiedOnDisk → [CONFLICT]
+            //   Deleted        → [DELETED]   (attached elsewhere via
+            //                    session_deleted_badge)
+            // The [NEW] badge takes priority for a freshly-named buffer
+            // that hasn't been written yet.
+            let badge = if ed.is_new {
+                Some("[NEW]")
+            } else if ed.external_conflict == Some(C::ModifiedOnDisk) {
+                Some("[CONFLICT]")
+            } else {
+                None
+            };
+            (format!("{name}{dirty}"), badge)
         }
         Session::Diff(view) => (format!("diff · {}", view.title), None),
         Session::Conflict(view) => {
@@ -1369,7 +1448,11 @@ fn draw_explorer_panel(frame: &mut Frame, area: Rect, app: &App) {
     let t = &app.theme;
     let focused = app.focus == FocusId::Explorer;
     let border_set = if focused { border::THICK } else { border::PLAIN };
-    let border_style = if focused { t.border_focused() } else { t.border_unfocused() };
+    let border_style = if focused {
+        explorer_mode_border_style(app)
+    } else {
+        t.border_unfocused()
+    };
 
     let mut block = Block::default()
         .borders(Borders::ALL)
@@ -1768,17 +1851,20 @@ fn draw_sub_label(
     let t = &app.theme;
     let indicator = scroll_indicator(scroll, visible, total);
 
-    let (marker, label_style) = if is_active {
-        ("▸ ", Style::default().fg(t.accent).add_modifier(Modifier::BOLD))
+    // Matches the `OPEN CELLS` / `PROJECTS` section headers in
+    // Normal-mode explorer: uppercase, dim + bold. Active sub-mode
+    // promotes the label to accent so the user can tell which section
+    // has the cursor.
+    let label_style = if is_active {
+        Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
     } else {
-        ("  ", Style::default().fg(t.fg).add_modifier(Modifier::BOLD))
+        Style::default().fg(t.dim).add_modifier(Modifier::BOLD)
     };
     let count_style = Style::default().fg(t.dim);
     let ind_style   = Style::default().fg(t.warn);
 
     let mut spans: Vec<Span<'static>> = vec![
-        Span::styled(marker.to_string(), label_style),
-        Span::styled(label.to_string(), label_style),
+        Span::styled(label.to_uppercase(), label_style),
         Span::styled(format!(" ({total})"), count_style),
     ];
 
@@ -2060,10 +2146,16 @@ fn open_cell_line(e: &Entry, idx: usize, app: &App, width: usize) -> Line<'stati
                     (Some(r), Some(p)) => !p.starts_with(r),
                     _                  => false,
                 };
-                // `[NEW]` flags a buffer whose path doesn't exist on
-                // disk yet — matches the cell-title badge so the
-                // explorer row is consistent with the focused cell.
-                let badge = if ed.is_new { Some("[NEW]") } else { None };
+                // Matches the cell-title badge so the explorer row is
+                // consistent with the focused cell.
+                use crate::editor::ExternalConflict as C;
+                let badge = if ed.is_new {
+                    Some("[NEW]")
+                } else if ed.external_conflict == Some(C::ModifiedOnDisk) {
+                    Some("[CONFLICT]")
+                } else {
+                    None
+                };
                 (ed.file_name().to_string(), badge, true, ed.dirty, external, path)
             }
         }
@@ -2074,10 +2166,14 @@ fn open_cell_line(e: &Entry, idx: usize, app: &App, width: usize) -> Line<'stati
     };
 
     let marker = if dirty { "● " } else { "  " };
+    // Editor rows pick up their git tint (modified/untracked/etc);
+    // non-editor rows (shell, claude, diff, conflict) stay on plain
+    // foreground — the accent colour was reading as "interactive link"
+    // which clashed with the section being a passive list.
     let (fg, mut mods) = if is_editor {
         git_tint(path.as_ref().and_then(|p| app.git.status_for(p)), t)
     } else {
-        (t.accent, Modifier::empty())
+        (t.fg, Modifier::empty())
     };
     // Minimized cells read as a dimmer, italic row so they're visibly
     // distinct from the live cells above them in the list.
@@ -2118,10 +2214,12 @@ fn open_cell_line(e: &Entry, idx: usize, app: &App, width: usize) -> Line<'stati
     // truncate the title with a `›` arrow — same marker the rest of
     // the explorer uses — while keeping the badges pinned to the right
     // edge so they're always visible.
+    let deleted_badge = session_deleted_badge(cell.active_session());
     let prefix_w = 4usize;
     let badge_w  = badge.map(|b| 1 + b.chars().count()).unwrap_or(0);     // " [BADGE]"
+    let del_w    = deleted_badge.map(|b| 1 + b.chars().count()).unwrap_or(0);
     let ext_w    = if external { "  [EXTERNAL]".chars().count() } else { 0 };
-    let suffix_w = badge_w + ext_w;
+    let suffix_w = badge_w + del_w + ext_w;
     let budget   = width.saturating_sub(prefix_w).saturating_sub(suffix_w);
 
     let title_chars: usize = title.chars().count();
@@ -2148,6 +2246,9 @@ fn open_cell_line(e: &Entry, idx: usize, app: &App, width: usize) -> Line<'stati
         spans.push(Span::raw(" ".repeat(pad_w)));
     }
     if let Some(b) = badge {
+        spans.push(Span::styled(format!(" {b}"), badge_style_for(t, b)));
+    }
+    if let Some(b) = deleted_badge {
         spans.push(Span::styled(format!(" {b}"), badge_style_for(t, b)));
     }
     if external {
@@ -2197,7 +2298,7 @@ fn dir_line(e: &Entry, t: &Theme, app: &App) -> Line<'static> {
     let name = e.path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
     let (fg, mods) = git_tint(app.git.dir_status(&e.path), t);
     Line::from(Span::styled(
-        format!("{indent}{marker}{name}"),
+        format!("{indent}{marker}{name}/"),
         Style::default().fg(fg).add_modifier(mods),
     ))
 }
@@ -2219,7 +2320,9 @@ fn git_tint(s: Option<FileStatus>, t: &Theme) -> (Color, Modifier) {
         Some(FileStatus::Modified)  => (t.warn,  Modifier::empty()),
         Some(FileStatus::Added)     => (t.ok,    Modifier::empty()),
         Some(FileStatus::Renamed)   => (t.accent, Modifier::empty()),
-        Some(FileStatus::Untracked) => (t.info,  Modifier::empty()),
+        // Untracked files/dirs read as grey — they're visible but not
+        // part of the repo yet, so tint them dimmer than tracked ones.
+        Some(FileStatus::Untracked) => (t.dim,   Modifier::empty()),
         Some(FileStatus::Ignored)   => (t.muted, Modifier::empty()),
         None                        => (t.fg,    Modifier::empty()),
     }
@@ -2245,9 +2348,10 @@ fn draw_statusbar(frame: &mut Frame, area: Rect, app: &App) {
     // Outer Mode wins for Insert/Command; in Normal, the Explorer sub-mode
     // decides NOR/GIT/BCH/CHG so the badge tracks git pane state.
     let (badge_text, badge_style) = match &app.mode {
-        Mode::Insert       => (app.mode.badge(), Style::default().fg(t.bg).bg(t.ok).bold()),
-        Mode::Command {..} => (app.mode.badge(), Style::default().fg(t.bg).bg(t.warn).bold()),
-        Mode::Visual {..}  => (app.mode.badge(), Style::default().fg(t.bg).bg(t.accent).bold()),
+        Mode::Insert        => (app.mode.badge(), Style::default().fg(t.bg).bg(t.ok).bold()),
+        Mode::Command {..}  => (app.mode.badge(), Style::default().fg(t.bg).bg(t.warn).bold()),
+        Mode::Visual {..}   => (app.mode.badge(), Style::default().fg(t.bg).bg(t.accent).bold()),
+        Mode::Password {..} => (app.mode.badge(), Style::default().fg(t.bg).bg(t.err).bold()),
         Mode::Normal => {
             let (text, color) = if app.focus == FocusId::Explorer {
                 match app.explorer_mode {
@@ -2266,8 +2370,17 @@ fn draw_statusbar(frame: &mut Frame, area: Rect, app: &App) {
     left.push(Span::styled(format!(" {badge_text} "), badge_style));
     left.push(Span::raw("  "));
 
-    // ── left context: command buffer in CMD mode, focus-aware otherwise ──
-    if let Mode::Command { buffer } = &app.mode {
+    // ── left context: password prompt in PWD mode, command buffer in
+    // CMD mode, focus-aware otherwise ──
+    if let Mode::Password { buffer, .. } = &app.mode {
+        // Mask every character so shoulder-surfing and any screen
+        // recording of the terminal don't leak the password. Width
+        // tracks buffer length so Backspace visibly shortens the dots.
+        let mask: String = "•".repeat(buffer.chars().count());
+        left.push(Span::styled("sudo password: ", Style::default().fg(t.err).bold()));
+        left.push(Span::styled(mask, Style::default().fg(t.fg)));
+        left.push(Span::styled("▌", Style::default().fg(t.err)));
+    } else if let Mode::Command { buffer } = &app.mode {
         // `/` or `?` kicks off a search prompt — show the literal
         // prefix instead of `:` so the user reads "searching" not
         // "running a command".
@@ -2374,9 +2487,10 @@ fn draw_statusbar(frame: &mut Frame, area: Rect, app: &App) {
         "   [0 explorer  1-9 cell] "
     } else {
         match &app.mode {
-            Mode::Insert       => "",
-            Mode::Command {..} => "",
-            Mode::Visual {..}  => "   [d delete  y yank  c change  > indent  < dedent  Esc cancel] ",
+            Mode::Insert        => "",
+            Mode::Command {..}  => "",
+            Mode::Password {..} => "   [Enter submit  Esc cancel] ",
+            Mode::Visual {..}   => "   [d delete  y yank  c change  > indent  < dedent  Esc cancel] ",
             Mode::Normal => match app.focus {
                 FocusId::Cell(_) if app.focused_session_is_editor()
                                   => "   [i insert] ",

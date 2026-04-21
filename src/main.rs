@@ -92,9 +92,23 @@ fn main() -> Result<()> {
 fn parse_argv() -> Startup {
     let mut dirs:  Vec<PathBuf> = Vec::new();
     let mut files: Vec<PathBuf> = Vec::new();
-    for arg in std::env::args().skip(1) {
+    let mut args = std::env::args().skip(1).peekable();
+    while let Some(arg) = args.next() {
         if arg == "--version" || arg == "-V" {
             println!("ace {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        if arg == "--update" || arg == "-u" {
+            // Optional next arg is a tag. Anything starting with `-`
+            // (another flag) or `.`/`/` or an existing path doesn't
+            // count — treat the update as "latest" in that case.
+            let tag = match args.peek() {
+                Some(s) if !s.starts_with('-') && !s.contains(std::path::MAIN_SEPARATOR) && !s.contains('/') => {
+                    Some(args.next().unwrap())
+                }
+                _ => None,
+            };
+            run_update(tag.as_deref());
             std::process::exit(0);
         }
         let p = PathBuf::from(&arg);
@@ -177,6 +191,82 @@ fn apply_initial_focus(app: &mut App, saved: Option<usize>) {
     app.set_focus(target);
 }
 
+/// Invoke the cargo-dist installer for the requested tag (or latest).
+/// On Windows: `iwr | iex` the PowerShell installer. On Unix: pipe the
+/// shell installer through `sh`. The installer drops a fresh `ace`
+/// binary into the standard location and upgrades this one in place.
+fn run_update(tag: Option<&str>) {
+    const OWNER: &str = "stubbornmarlin3";
+    const REPO:  &str = "ACodeEditor";
+    // Package name (installer asset prefix) comes from Cargo — matches
+    // whatever cargo-dist uploads.
+    const PKG: &str = "acodeeditor";
+
+    let (os_name, installer_ext, installer_name) = if cfg!(target_os = "windows") {
+        ("windows", "ps1", format!("{PKG}-installer.ps1"))
+    } else {
+        ("unix", "sh", format!("{PKG}-installer.sh"))
+    };
+
+    // Normalize tag: users can pass `v0.2.0` or `0.2.0` — GitHub release
+    // tags in this repo are the version with or without a `v` prefix;
+    // fall back to `latest` when no tag is supplied.
+    let url = match tag {
+        Some(t) => {
+            let t = t.trim();
+            // `latest` keyword resolves to the latest release via the
+            // aliased `releases/latest` URL, which the installer script
+            // redirects through correctly.
+            if t.eq_ignore_ascii_case("latest") || t.is_empty() {
+                format!("https://github.com/{OWNER}/{REPO}/releases/latest/download/{installer_name}")
+            } else {
+                format!("https://github.com/{OWNER}/{REPO}/releases/download/{t}/{installer_name}")
+            }
+        }
+        None => format!("https://github.com/{OWNER}/{REPO}/releases/latest/download/{installer_name}"),
+    };
+
+    let label = tag.unwrap_or("latest");
+    eprintln!("ace: updating to {label} via {os_name} installer…");
+    eprintln!("     {url}");
+
+    let status = if cfg!(target_os = "windows") {
+        std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-Command",
+                &format!("irm {url} | iex"),
+            ])
+            .status()
+    } else {
+        // sh -c lets us compose a pipeline; prefer curl (common) and
+        // fall back to wget if that's not available.
+        let cmd = format!(
+            "curl --proto '=https' --tlsv1.2 -LsSf {url} | sh \
+             || (wget -qO- {url} | sh)"
+        );
+        std::process::Command::new("sh")
+            .args(["-c", &cmd])
+            .status()
+    };
+
+    match status {
+        Ok(s) if s.success() => {
+            eprintln!("ace: update complete.");
+        }
+        Ok(s) => {
+            eprintln!("ace: update failed (installer exited with {s}).");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("ace: update failed to launch installer: {e}");
+            let _ = installer_ext;
+            std::process::exit(1);
+        }
+    }
+}
+
 fn current_term_rect() -> Rect {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     Rect { x: 0, y: 0, width: cols, height: rows }
@@ -185,6 +275,15 @@ fn current_term_rect() -> Rect {
 fn resize_ptys_if_needed(app: &mut App, term: Rect) {
     let areas = ui::layout(term, app);
     for (i, cell) in app.cells.iter_mut().enumerate() {
+        // Minimized cells get a zero rect from the layout. Resizing the
+        // PTY down to (3, 20) makes the child reformat its buffer for a
+        // tiny pane; on restore it's stuck with that narrow layout until
+        // the next full redraw. Skip the resize and keep the PTY at its
+        // last live size so claude/shell output stays readable when the
+        // cell comes back.
+        if cell.minimized {
+            continue;
+        }
         let rect = match areas.cells.get(i).copied() {
             Some(r) => r,
             None => continue,
@@ -206,6 +305,8 @@ fn run(
     rx: &mpsc::Receiver<AppEvent>,
 ) -> Result<()> {
     resize_ptys_if_needed(app, current_term_rect());
+    let mut last_title = String::new();
+    update_terminal_title(app, &mut last_title);
     terminal.draw(|f| ui::draw(f, app))?;
 
     while !app.should_quit {
@@ -248,15 +349,15 @@ fn run(
                 // Slow fallback — FS events handle the real-time path.
                 // State persistence is handled by the end-of-loop
                 // hash-diff check, so nothing to do here for .acedata.
-                app.explorer.refresh(&app.projects, app.cells.len());
+                app.pending_explorer_refresh = true;
             }
             Ok(AppEvent::FsChange(path)) => {
-                // Real-time: a file changed under a watched root. Run
-                // editor reconciliation against every cell whose editor
-                // owns that path, and kick an explorer rescan so the
-                // tree reflects new/removed files immediately.
+                // Real-time: a file changed under a watched root. Reconcile
+                // the affected editors immediately (cheap and path-scoped)
+                // but coalesce the explorer re-scan: a single save can emit
+                // several FS events and a full tree walk per event adds up.
                 app.handle_fs_change(&path);
-                app.explorer.refresh(&app.projects, app.cells.len());
+                app.pending_explorer_refresh = true;
             }
             Err(RecvTimeoutError::Timeout) => {
                 // Wake for a status-bar tick. The tick itself runs
@@ -283,6 +384,11 @@ fn run(
                 if reaped == 1 { "" } else { "s" },
             ));
         }
+        // One coalesced explorer refresh per loop iteration, no matter
+        // how many FS events fed the flag. Cheap when the flag is clear.
+        if std::mem::take(&mut app.pending_explorer_refresh) {
+            app.explorer.refresh(&app.projects, app.cells.len());
+        }
         // Keep all PTYs in sync with current layout — explorer panel width,
         // cell count, and active layout algorithm all affect cell geometry.
         resize_ptys_if_needed(app, current_term_rect());
@@ -297,9 +403,63 @@ fn run(
             app.should_quit = true;
         }
         sync_syntax(app);
+        update_terminal_title(app, &mut last_title);
         terminal.draw(|f| ui::draw(f, app))?;
     }
     Ok(())
+}
+
+/// Push an OSC 2 title to the outer terminal reflecting the focused
+/// cell: `Ace | {title}`. Skips the write when the title hasn't changed
+/// so we don't spam the tty with escape codes every frame.
+fn update_terminal_title(app: &App, last: &mut String) {
+    use std::io::Write;
+    let label = current_cell_title(app);
+    let desired = if label.is_empty() { "Ace".to_string() } else { format!("Ace | {label}") };
+    if desired == *last {
+        return;
+    }
+    // OSC 2 — set window title. BEL terminator is more widely supported
+    // than ST (some terminals, including older Windows Terminal, don't
+    // honour ESC \). Errors are swallowed — title is a nicety, never a
+    // blocker.
+    let seq = format!("\x1b]2;{desired}\x07");
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(seq.as_bytes());
+    let _ = stdout.flush();
+    *last = desired;
+}
+
+/// Human-readable label for the currently-focused element: editor file
+/// name, PTY program or child-provided title, diff/conflict title, or
+/// `explorer` when the sidebar has focus.
+fn current_cell_title(app: &App) -> String {
+    match app.focus {
+        FocusId::Explorer => "explorer".to_string(),
+        FocusId::Cell(i) => {
+            let Some(cell) = app.cells.get(i) else { return String::new(); };
+            use cell::Session as S;
+            match cell.active_session() {
+                S::Edit(ed)      => ed.file_name().to_string(),
+                S::Shell(p)      => {
+                    let t = p.title();
+                    if !t.trim().is_empty() { t } else {
+                        std::path::Path::new(&p.program)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("shell")
+                            .to_string()
+                    }
+                }
+                S::Claude(p)     => {
+                    let t = p.title();
+                    if !t.trim().is_empty() { t } else { "claude".to_string() }
+                }
+                S::Diff(v)       => format!("diff · {}", v.title),
+                S::Conflict(v)   => format!("conflict · {}", v.title),
+            }
+        }
+    }
 }
 
 /// Re-highlight any editor buffers whose content changed since the last draw.
@@ -370,10 +530,29 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     app.status.clear();
 
     match app.mode {
-        Mode::Normal       => handle_normal(app, key),
-        Mode::Insert       => handle_insert(app, key),
-        Mode::Visual {..}  => handle_visual(app, key),
-        Mode::Command {..} => handle_command(app, key),
+        Mode::Normal        => handle_normal(app, key),
+        Mode::Insert        => handle_insert(app, key),
+        Mode::Visual {..}   => handle_visual(app, key),
+        Mode::Command {..}  => handle_command(app, key),
+        Mode::Password {..} => handle_password(app, key),
+    }
+}
+
+/// Hidden-input prompt driven by :sudo / :w! / :x!. Chars append to the
+/// password buffer without echoing to the screen; Enter submits (spawn
+/// sudo); Esc cancels. Ctrl-C was already handled upstream (routed to a
+/// focused PTY) so we don't need to treat it specially here.
+fn handle_password(app: &mut App, key: KeyEvent) {
+    match (key.modifiers, key.code) {
+        (_, KeyCode::Esc)       => app.password_cancel(),
+        (_, KeyCode::Enter)     => app.password_submit(),
+        (_, KeyCode::Backspace) => app.password_backspace(),
+        (m, KeyCode::Char(c))
+            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+        {
+            app.password_push(c);
+        }
+        _ => {}
     }
 }
 
@@ -565,6 +744,14 @@ fn clipboard_get() -> Result<String, String> {
     with_clipboard(|clip| clip.get_text().map_err(|e| e.to_string()))
 }
 
+/// Hard cap on clipboard paste size. Above this we refuse the paste
+/// rather than shove the whole blob into the PTY: a 1 GB clipboard
+/// (common on Windows after a copy from a huge file) would otherwise
+/// allocate a second copy here, then another inside vt100 as the child
+/// echoes back, and stall the UI for seconds. 16 MB is comfortably more
+/// than any realistic paste and well under "my editor froze" territory.
+const CLIPBOARD_PASTE_MAX: usize = 16 * 1024 * 1024;
+
 /// Paste clipboard text to the focused PTY. Uses the child's declared
 /// bracketed-paste mode when set (so `vim`-like TUIs see a paste event
 /// rather than characters typed one by one).
@@ -574,6 +761,14 @@ fn pty_paste_from_clipboard(app: &mut App) {
         Ok(_)                  => { app.status.push_auto("clipboard empty".into()); return; }
         Err(e)                 => { app.status.push_auto(format!("clipboard: {e}")); return; }
     };
+    if text.len() > CLIPBOARD_PASTE_MAX {
+        app.status.push_auto(format!(
+            "clipboard too large ({} MB) — max {} MB",
+            text.len() / (1024 * 1024),
+            CLIPBOARD_PASTE_MAX / (1024 * 1024),
+        ));
+        return;
+    }
     let Some(pty) = app.focused_pty_mut() else { return; };
     let bracketed = pty.parser.lock().map(|p| p.screen().bracketed_paste()).unwrap_or(false);
     let bytes = if bracketed {
@@ -622,6 +817,26 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
                 // stay armed
                 return;
             }
+            // Space → s → N  : swap content, focus stays at original slot.
+            (KeyModifiers::NONE, KeyCode::Char('s')) => {
+                app.pending_jump = false;
+                app.arm_swap(false);
+                return;
+            }
+            // Space → m → N  : move focus+content to target slot. Space
+            // → m followed by any non-digit minimizes the focused cell
+            // (see pending_swap handler below).
+            (KeyModifiers::NONE, KeyCode::Char('m')) => {
+                app.pending_jump = false;
+                app.arm_swap(true);
+                return;
+            }
+            // Space → q : quit the focused cell (shorthand for `:q`).
+            (KeyModifiers::NONE, KeyCode::Char('q')) => {
+                app.pending_jump = false;
+                app.cmd_close(false);
+                return;
+            }
             _ => {
                 app.pending_jump = false;
                 return;
@@ -629,22 +844,13 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         }
     }
 
-    // Ctrl+Space / Ctrl+Alt+Space arm swap mode — same arm model as
-    // Space→jump, two variants:
-    //   * Ctrl+Space      → focus stays at the original slot (content
-    //                       swaps under the user).
-    //   * Ctrl+Alt+Space  → focus follows the original content to the
-    //                       target slot.
-    // Works on every terminal — no kitty protocol needed.
-    if key.code == KeyCode::Char(' ') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        let follow = key.modifiers.contains(KeyModifiers::ALT);
-        app.arm_swap(follow);
-        return;
-    }
-
-    // Swap-arm mode: Ctrl+Space primed it, the next digit picks the
-    // target (or `0` to minimize). Any other key cancels so the user
-    // isn't stuck in swap mode.
+    // Swap / move arm — primed by Space → s (pending_swap) or
+    // Space → m (pending_swap_follow). The next digit picks the target:
+    //   * 0        → minimize focused cell
+    //   * 1..9     → swap / move with that cell
+    // For `m` (pending_swap_follow) a non-digit key minimizes instead
+    // of cancelling — so `Space m <anything>` is a one-chord minimize.
+    // For `s` (pending_swap), non-digit cancels (original behaviour).
     if app.pending_swap || app.pending_swap_follow {
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Char(c)) if c.is_ascii_digit() => {
@@ -656,8 +862,12 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
                 return;
             }
             _ => {
+                let was_follow = app.pending_swap_follow;
                 app.pending_swap = false;
                 app.pending_swap_follow = false;
+                if was_follow {
+                    app.minimize_focused();
+                }
                 return;
             }
         }

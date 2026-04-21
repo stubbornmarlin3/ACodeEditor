@@ -78,6 +78,22 @@ impl PtySession {
         Self::spawn(rows, cols, program, cmd, tx)
     }
 
+    /// Spawn a shell from an explicit argv (bypasses the config /
+    /// platform default). First element is the executable; remaining
+    /// elements are its args. Returns an error if the argv is empty.
+    pub fn spawn_shell_custom(
+        argv: Vec<String>,
+        rows: u16,
+        cols: u16,
+        cwd: Option<&Path>,
+        tx: Sender<AppEvent>,
+    ) -> Result<Self> {
+        let (program, mut cmd) = build_from_argv(argv)
+            .ok_or_else(|| anyhow::anyhow!("empty shell argv"))?;
+        apply_cwd(&mut cmd, cwd);
+        Self::spawn(rows, cols, program, cmd, tx)
+    }
+
     pub fn spawn_claude(rows: u16, cols: u16, cwd: Option<&Path>, tx: Sender<AppEvent>) -> Result<Self> {
         let (program, mut cmd) = default_claude_command();
         apply_cwd(&mut cmd, cwd);
@@ -159,7 +175,11 @@ impl PtySession {
         // Any user input snaps the view back to live — matches every
         // other terminal emulator.
         self.scroll_reset();
-        let mut w = self.writer.lock().expect("pty writer poisoned");
+        // Recover from poison: a panic in a PTY helper thread (reader,
+        // handshake responder) leaves the writer mutex poisoned, but the
+        // underlying `Write` is still intact — we can keep serving user
+        // input instead of crashing the editor.
+        let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         w.write_all(bytes)?;
         w.flush()
     }
@@ -204,7 +224,11 @@ impl PtySession {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        self.parser.lock().unwrap().set_size(rows, cols);
+        // Poison recovery: the parser is still structurally valid after
+        // a panicked reader thread — just resize it anyway.
+        if let Ok(mut p) = self.parser.lock().or_else(|e| Ok::<_, ()>(e.into_inner())) {
+            p.set_size(rows, cols);
+        }
         self.rows = rows;
         self.cols = cols;
         // Clamp cursor + anchor to the new column range. `abs` is

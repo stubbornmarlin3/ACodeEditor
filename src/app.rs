@@ -10,7 +10,7 @@ use crate::git::{self, ChangeRow, GitSnapshot};
 use crate::projects::ProjectList;
 use crate::session_state::{CellState, SessionState, StateSnapshot};
 use crate::status::StatusBar;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
@@ -29,6 +29,70 @@ pub fn home_dir() -> Option<std::path::PathBuf> {
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(std::path::PathBuf::from)
         .filter(|p| p.is_dir())
+}
+
+/// Ensure `.gitignore` at `project_root` contains the ace session
+/// artefacts (`.acedata`, `.acerc`). Only acts if the project has a
+/// `.git/` directory (anything else is either a non-repo folder or a
+/// worktree we don't own). No-op when `.acerc auto_gitignore = false`.
+/// Best-effort: IO errors are swallowed so a read-only filesystem doesn't
+/// break session startup.
+pub fn ensure_gitignore_entries(project_root: &std::path::Path) {
+    // Opt-out via user-level or project-level `.acerc`. Unset / true →
+    // inject; false → skip.
+    let cfg = crate::config::Config::load();
+    if matches!(cfg.auto_gitignore, Some(false)) {
+        return;
+    }
+    if !project_root.join(".git").exists() {
+        return;
+    }
+    let gi = project_root.join(".gitignore");
+    let existing = std::fs::read_to_string(&gi).unwrap_or_default();
+    let wanted = [".acedata", ".acerc"];
+    let has_entry = |content: &str, pat: &str| -> bool {
+        content
+            .lines()
+            .map(str::trim)
+            .any(|l| l == pat || l == format!("/{pat}"))
+    };
+    let missing: Vec<&str> = wanted.iter().copied().filter(|p| !has_entry(&existing, p)).collect();
+    if missing.is_empty() {
+        return;
+    }
+    let mut out = existing.clone();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.is_empty() {
+        out.push_str("\n# ace session data (auto-added; disable via .acerc auto_gitignore=false)\n");
+    } else {
+        out.push_str("# ace session data (auto-added; disable via .acerc auto_gitignore=false)\n");
+    }
+    for m in &missing {
+        out.push_str(m);
+        out.push('\n');
+    }
+    let _ = std::fs::write(&gi, out);
+}
+
+/// Expand a leading `~` (or `~/…`) to the user's home directory. Any
+/// non-tilde input and paths without a leading tilde are returned
+/// unchanged. Used at every command-bar path entry point so users don't
+/// have to type the full home path.
+pub fn expand_tilde(input: &str) -> String {
+    if input == "~" {
+        if let Some(home) = home_dir() {
+            return home.to_string_lossy().into_owned();
+        }
+        return input.to_string();
+    }
+    if let Some(rest) = input.strip_prefix("~/").or_else(|| input.strip_prefix("~\\")) {
+        if let Some(home) = home_dir() {
+            return home.join(rest).to_string_lossy().into_owned();
+        }
+    }
+    input.to_string()
 }
 
 /// Remap an index when a `Vec::remove(from); insert(to, _)` happens.
@@ -111,6 +175,24 @@ pub enum Mode {
     /// types never land here.
     Visual { linewise: bool },
     Command { buffer: String },
+    /// Hidden-input prompt for a sudo password. Entered via `:sudo …`,
+    /// `:w!`, `:w!q`, or `:x!`; the buffer never renders as cleartext.
+    /// Submit runs `action`; Esc cancels without spawning sudo.
+    Password { buffer: String, action: SudoAction },
+}
+
+/// What a pending sudo prompt should do once the password is submitted.
+/// Captured before entering `Mode::Password` so the action runs with the
+/// focus state the user had when they typed the command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SudoAction {
+    /// `:sudo w` / `:w!` — write via `sudo tee`, stay open.
+    Write,
+    /// `:sudo wq` / `:sudo x` / `:w!q` / `:x!` — write, then close the
+    /// focused cell.
+    WriteClose,
+    /// `:sudo wQ` — write, then quit the whole app.
+    WriteQuitApp,
 }
 
 impl Mode {
@@ -120,6 +202,7 @@ impl Mode {
             Mode::Insert              => "INS",
             Mode::Visual { linewise } => if *linewise { "V-L" } else { "VIS" },
             Mode::Command {..}        => "CMD",
+            Mode::Password {..}       => "PWD",
         }
     }
 }
@@ -283,6 +366,25 @@ pub struct App {
     /// `buffer[start..]` — so the buffer alone is authoritative for
     /// what will run on Enter.
     pub completion: Option<CompletionState>,
+
+    /// Coalesced explorer-refresh flag. FS events fire in bursts (a save
+    /// can easily produce 3-5 events on Windows); instead of doing a full
+    /// tree re-scan per event we set this flag and let the main loop do
+    /// one refresh per iteration.
+    pub pending_explorer_refresh: bool,
+
+    /// Cells parked by project root on switch-out. Preserves PTY state
+    /// (shell/claude children keep running in the background) so
+    /// returning to a project brings back the exact same running
+    /// sessions instead of respawning from `.acedata`. Keyed by the
+    /// project's absolute root path.
+    pub parked_cells: HashMap<PathBuf, ParkedProject>,
+}
+
+/// A project's cells parked while the user is in another project.
+pub struct ParkedProject {
+    pub cells: Vec<Cell>,
+    pub focus: Option<usize>,
 }
 
 /// In-flight state for a `:`-command Tab-completion cycle.
@@ -414,6 +516,8 @@ impl App {
             pending_confirm: None,
             preview_cell_idx: None,
             completion: None,
+            pending_explorer_refresh: false,
+            parked_cells: HashMap::new(),
         }
     }
 
@@ -516,8 +620,10 @@ impl App {
         // leave in GitChanges and come back, you land back in
         // GitChanges. `clamp_git_cursors` corrects stale cursors when
         // a snapshot refresh changes the underlying lists.
-        // Don't blow away Command mode (user is composing a command).
-        if matches!(self.mode, Mode::Command { .. }) {
+        // Don't blow away Command or Password mode (user is composing
+        // a command / typing a sudo password — focus changes shouldn't
+        // silently discard that).
+        if matches!(self.mode, Mode::Command { .. } | Mode::Password { .. }) {
             return;
         }
         if same {
@@ -626,6 +732,75 @@ impl App {
             None     => self.set_focus(FocusId::Explorer),
         }
         self.status.push_auto("minimized".into());
+    }
+
+    /// Minimize a specific cell by index (0-based). Like
+    /// `minimize_focused` but targets any cell, not just the focused one.
+    /// Focus is preserved if possible; if the focused cell itself is
+    /// minimized, falls back to the first visible cell (or Explorer).
+    pub fn minimize_idx(&mut self, i: usize) {
+        if i >= self.cells.len() {
+            self.status.push_auto(format!("no cell {}", i + 1));
+            return;
+        }
+        if self.cells[i].minimized {
+            return;
+        }
+        let focused = matches!(self.focus, FocusId::Cell(f) if f == i);
+        let to = self.cells.len() - 1;
+        // Stash focus index before the move so we can restore it if we
+        // weren't targeting the focused cell.
+        let saved_focus = if let FocusId::Cell(f) = self.focus { Some(f) } else { None };
+        self.move_cell(i, to);
+        self.cells[to].minimized = true;
+        if focused {
+            let next_visible = self.cells.iter().position(|c| !c.minimized);
+            match next_visible {
+                Some(vi) => self.set_focus(FocusId::Cell(vi)),
+                None     => self.set_focus(FocusId::Explorer),
+            }
+        } else if let Some(f) = saved_focus {
+            // `move_cell` already remapped focus; re-clamp in case the
+            // now-minimized cell is ahead of visible focus.
+            let remapped = if let FocusId::Cell(rf) = self.focus { rf } else { f };
+            self.set_focus(FocusId::Cell(remapped));
+        }
+        self.status.push_auto(format!("minimized cell {}", i + 1));
+    }
+
+    /// `:min N` / `:min *` — minimize specific cell(s). `None` →
+    /// focused cell (same as bare `:min`).
+    pub fn cmd_minimize_target(&mut self, target: Option<CellTarget>) {
+        match target {
+            None                       => self.minimize_focused(),
+            Some(CellTarget::Idx(i))   => self.minimize_idx(i),
+            Some(CellTarget::All)      => {
+                // Leave the focused cell visible so there's always one
+                // live pane and the user keeps whatever they were
+                // working on. Falls back to cell 0 when the explorer is
+                // focused (no focused cell to protect).
+                let keep = match self.focus {
+                    FocusId::Cell(i) => i,
+                    _                => 0,
+                };
+                let n = self.cells.len();
+                // `minimize_idx` moves the cell to the tail, which
+                // renumbers indices as we go. Collect the set of cells
+                // to minimize before we start mutating so `keep` stays
+                // meaningful for the whole pass.
+                let mut todo: Vec<usize> = (0..n).filter(|&i| i != keep && !self.cells[i].minimized).collect();
+                // Highest index first so each minimize doesn't disturb
+                // the still-queued indices (move_cell shifts elements in
+                // (i, to] down by one; working from the tail avoids
+                // hitting any of them).
+                todo.sort_unstable_by(|a, b| b.cmp(a));
+                for i in todo {
+                    if i < self.cells.len() && !self.cells[i].minimized {
+                        self.minimize_idx(i);
+                    }
+                }
+            }
+        }
     }
 
     /// Restore a minimized cell by moving it to position 0 (the
@@ -740,7 +915,12 @@ impl App {
         // sentinels so we can move without cloning `Cell`.
         let mut slots: Vec<Option<Cell>> = self.cells.drain(..).map(Some).collect();
         for old_i in new_order.iter().copied() {
-            self.cells.push(slots[old_i].take().unwrap());
+            // new_order is a permutation of 0..n so each slot is taken
+            // exactly once — but if that invariant ever breaks (future
+            // edit), silently skip rather than panic mid-relayout.
+            if let Some(cell) = slots.get_mut(old_i).and_then(Option::take) {
+                self.cells.push(cell);
+            }
         }
         // Remap focus.
         if let Some(old_i) = focused_cell_idx {
@@ -873,6 +1053,94 @@ impl App {
             buffer.push(c);
         }
         self.refresh_completion_preview();
+    }
+
+    // ── sudo / password prompt ──────────────────────────────────────────
+    //
+    // `:sudo w` (and aliases `:w!`, `:w!q`, `:x!`) flip the mode to
+    // `Password`. Keystrokes from main.rs's `handle_password` land on
+    // `password_push`/`password_backspace`; Enter calls
+    // `password_submit` which spawns `sudo -S tee <path>` with the
+    // password on stdin and the buffer as the file content. Esc cancels
+    // without spawning anything.
+
+    pub fn begin_sudo(&mut self, action: SudoAction) {
+        let Some(ed) = self.focused_editor_mut() else {
+            self.status.push_auto("sudo: needs editor focus".into());
+            return;
+        };
+        if ed.path.is_none() {
+            self.status.push_auto("sudo: buffer has no file — try :w <path> first".into());
+            return;
+        }
+        self.mode = Mode::Password { buffer: String::new(), action };
+        self.status.push_auto("sudo: enter password (Enter to submit, Esc to cancel)".into());
+        self.completion = None;
+    }
+
+    pub fn password_push(&mut self, c: char) {
+        if let Mode::Password { buffer, .. } = &mut self.mode {
+            buffer.push(c);
+        }
+    }
+
+    pub fn password_backspace(&mut self) {
+        if let Mode::Password { buffer, .. } = &mut self.mode {
+            buffer.pop();
+        }
+    }
+
+    pub fn password_cancel(&mut self) {
+        if matches!(self.mode, Mode::Password { .. }) {
+            self.mode = self.natural_mode_for_focus();
+            self.status.push_auto("sudo cancelled".into());
+        }
+    }
+
+    pub fn password_submit(&mut self) {
+        // Take the mode out so we own `buffer` and `action` while we
+        // mutate the editor below. Stays in Normal on the failure path
+        // — re-running the command is the user's next step.
+        let (password, action) = match std::mem::replace(&mut self.mode, Mode::Normal) {
+            Mode::Password { buffer, action } => (buffer, action),
+            other => { self.mode = other; return; }
+        };
+        let Some(ed) = self.focused_editor_mut() else {
+            self.status.push_auto("sudo: no focused editor".into());
+            return;
+        };
+        let Some(path) = ed.path.clone() else {
+            self.status.push_auto("sudo: no file".into());
+            return;
+        };
+        let mut content = ed.textarea.lines().join("\n");
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        let result = exec_sudo_write(&path, content.as_bytes(), &password);
+        // Zeroize the copy we hold so the password doesn't sit around in
+        // the heap any longer than necessary. (The kernel still has
+        // copies via the pipe; this is best-effort.)
+        drop(password);
+        match result {
+            Ok(()) => {
+                if let Some(ed) = self.focused_editor_mut() {
+                    // `sudo tee` has overwritten the file; reload to
+                    // resync saved_hash / mtime / size and clear dirty.
+                    let _ = ed.reload_from_disk();
+                }
+                self.refresh_git();
+                self.status.push_auto(format!("sudo wrote {}", path.display()));
+                match action {
+                    SudoAction::Write        => {}
+                    SudoAction::WriteClose   => self.cmd_close(false),
+                    SudoAction::WriteQuitApp => { self.should_quit = true; }
+                }
+            }
+            Err(e) => {
+                self.status.push_auto(format!("sudo: {e}"));
+            }
+        }
     }
 
     pub fn command_backspace(&mut self) {
@@ -1011,6 +1279,23 @@ impl App {
         if cmd.is_empty() {
             return;
         }
+        // Sudo shortcuts — any of these open the password prompt before
+        // any disk write happens. Keep this before cell-target parsing so
+        // `:w!` doesn't get eaten as "force-write focused cell".
+        //
+        //   :sudo w   :w!         → sudo write
+        //   :sudo wq  :w!q  :x!   → sudo write + close focused cell
+        //   :sudo x               → alias for :sudo wq
+        //   :sudo wQ              → sudo write + quit app
+        //
+        // Earlier `:w!` meant "force over external conflict"; sudo
+        // supersedes it (the kernel writes regardless of local-editor
+        // conflict state). Users who want the old behaviour can `:e!` to
+        // reload then `:w`, or `:conflict` to merge.
+        if let Some(action) = parse_sudo_command(cmd) {
+            self.begin_sudo(action);
+            return;
+        }
         // Cell-target commands: a trailing 1-based index or `*`
         // wildcard operates on that cell (or every cell) instead of
         // the focused one. Handle them up-front so the match below
@@ -1024,6 +1309,7 @@ impl App {
                 "w"  | "write"                    => { self.cmd_write_target(false, Some(target)); return; }
                 "w!" | "write!"                   => { self.cmd_write_target(true,  Some(target)); return; }
                 "wq" | "x"                        => { self.cmd_write_quit_target(Some(target)); return; }
+                "min" | "minimize"                => { self.cmd_minimize_target(Some(target)); return; }
                 _ => {} // fall through — not a cell-target command
             }
         }
@@ -1108,6 +1394,29 @@ impl App {
             _ if cmd.starts_with("new ") => {
                 let rest = cmd.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
                 self.cmd_new(rest);
+            }
+            // Shorthands for `:new claude` / `:new shell [exec]`. `:s`
+            // and `:c` save a keystroke for the most common spawns;
+            // `:shell zsh` / `:shell bash -i` override the default shell
+            // for one cell.
+            "c" | "claude"                      => self.cmd_new("claude"),
+            _ if cmd.starts_with("c ") || cmd.starts_with("claude ") => {
+                let rest = cmd.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
+                // Claude doesn't take arbitrary args here — everything
+                // past `:claude` is ignored for now, matching `:new
+                // claude`'s existing shape. Kept as a future-extension
+                // hook.
+                let _ = rest;
+                self.cmd_new("claude");
+            }
+            "s" | "shell"                       => self.cmd_new("shell"),
+            _ if cmd.starts_with("s ") || cmd.starts_with("shell ") => {
+                let rest = cmd.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
+                if rest.is_empty() {
+                    self.cmd_new("shell");
+                } else {
+                    self.cmd_new(&format!("shell {rest}"));
+                }
             }
             _ if cmd.starts_with("tab ") => {
                 let rest = cmd.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
@@ -1392,7 +1701,8 @@ impl App {
             self.status.push_auto("usage: :w <path>".into());
             return;
         }
-        let p = std::path::Path::new(path).to_path_buf();
+        let expanded = expand_tilde(path);
+        let p = std::path::Path::new(&expanded).to_path_buf();
         if p.is_dir() {
             self.status.push_auto(format!("{} is a directory", p.display()));
             return;
@@ -1583,7 +1893,8 @@ impl App {
             self.status.push_auto("usage: :e <path>".into());
             return;
         }
-        let p = std::path::Path::new(path);
+        let expanded = expand_tilde(path);
+        let p = std::path::Path::new(&expanded);
         if p.is_dir() {
             self.status.push_auto(format!("{} is a directory", p.display()));
             return;
@@ -1847,16 +2158,29 @@ impl App {
         cols: u16,
     ) -> Result<Session, String> {
         match kind {
-            SessionKind::Shell => PtySession::spawn_shell(rows, cols, self.pty_cwd().as_deref(), self.tx.clone())
-                .map(Session::Shell)
-                .map_err(|e| format!("spawn failed: {e}")),
+            SessionKind::Shell => {
+                // `:new shell` uses the configured default; `:new shell
+                // <argv>` spawns the given executable instead (e.g. `:new
+                // shell zsh` or `:new shell "bash -i"`). argv is parsed
+                // with the same CMD-style splitter the `.acerc` shell
+                // key uses, so quoted paths with spaces round-trip.
+                let result = if rest.is_empty() {
+                    PtySession::spawn_shell(rows, cols, self.pty_cwd().as_deref(), self.tx.clone())
+                } else {
+                    let argv = crate::config::parse_argv(rest)
+                        .ok_or_else(|| format!("bad shell spec: {rest}"))?;
+                    PtySession::spawn_shell_custom(argv, rows, cols, self.pty_cwd().as_deref(), self.tx.clone())
+                };
+                result.map(Session::Shell).map_err(|e| format!("spawn failed: {e}"))
+            }
             SessionKind::Claude => PtySession::spawn_claude(rows, cols, self.pty_cwd().as_deref(), self.tx.clone())
                 .map(Session::Claude)
                 .map_err(|e| format!("spawn failed: {e}")),
             SessionKind::Edit => {
                 let mut ed = Editor::empty();
                 if !rest.is_empty() {
-                    let p = std::path::Path::new(rest);
+                    let expanded = expand_tilde(rest);
+                    let p = std::path::Path::new(&expanded);
                     if p.is_dir() {
                         return Err(format!("{} is a directory", p.display()));
                     }
@@ -2147,6 +2471,10 @@ impl App {
     pub fn persist_cells(&self) {
         let Some(root) = self.current_project_root() else { return; };
         let _ = crate::session_state::save(&root, &self.acedata_snapshot());
+        // Gitignore injection happens alongside persistence so users
+        // don't commit their session state by accident. Guarded by
+        // `.acerc auto_gitignore = false` if they want to opt out.
+        ensure_gitignore_entries(&root);
     }
 
     /// End-of-loop persistence: hash the current snapshot and save if
@@ -2272,7 +2600,7 @@ impl App {
         let root = if path.is_empty() {
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
         } else {
-            std::path::PathBuf::from(path)
+            std::path::PathBuf::from(expand_tilde(path))
         };
         if !root.exists() {
             self.status.push_auto(format!("no such path: {}", root.display()));
@@ -2318,6 +2646,12 @@ impl App {
         let is_active = idx == self.projects.active;
 
         if !is_active {
+            // Drop any parked cells for this project — their PTYs were
+            // still running in the background but the user is explicitly
+            // closing the project, so the sessions go with it.
+            if let Some(root) = self.projects.projects.get(idx).map(|p| p.root.clone()) {
+                self.parked_cells.remove(&root);
+            }
             if self.projects.remove(idx) {
                 let _ = self.projects.save();
                 self.explorer.on_project_switch(&self.projects, self.cells.len());
@@ -2340,6 +2674,10 @@ impl App {
         // they belong to it conceptually.
         self.persist_cells();
         let outgoing_root = self.projects.projects[idx].root.clone();
+        // Project is being closed, not just switched away from — drop any
+        // parked cells so we don't leak running PTYs for a project that
+        // no longer exists.
+        self.parked_cells.remove(&outgoing_root);
         let external_cells: Vec<Cell> = std::mem::take(&mut self.cells)
             .into_iter()
             .filter(|c| cell_is_external_to(c, &outgoing_root))
@@ -2393,12 +2731,19 @@ impl App {
         self.refresh_git();
         self.projects.refresh_states();
         let _ = self.projects.save();
-        let (restored, saved_focus) = match crate::session_state::load(&root) {
-            Some(snap) => {
-                let f = snap.focus;
-                (self.restore_cells_from_snapshot(&snap), f)
+        let (restored, saved_focus) = if let Some(parked) = self.parked_cells.remove(&root) {
+            let focus = parked.focus;
+            let n = parked.cells.len();
+            self.cells.extend(parked.cells);
+            (n, focus)
+        } else {
+            match crate::session_state::load(&root) {
+                Some(snap) => {
+                    let f = snap.focus;
+                    (self.restore_cells_from_snapshot(&snap), f)
+                }
+                None => (0, None),
             }
-            None => (0, None),
         };
         // Append externals carried over from the closed project so the
         // user's non-project work survives the switch.
@@ -2465,16 +2810,21 @@ impl App {
         //    switch. We do this before flipping `active`.
         self.persist_cells();
 
-        // 2. Tear down outgoing cells. When the previous state had no
-        //    active project (files-only session), the cells weren't
-        //    persisted anywhere — preserve them all so the user's work
-        //    survives. Otherwise they've already been saved to the
-        //    outgoing project's `.acedata` and will come back on return.
-        let preserve_all = self.current_project_root().is_none();
+        // 2. Park outgoing cells in memory so their PTYs keep running in
+        //    the background. Returning to this project later pulls them
+        //    back verbatim instead of respawning from `.acedata`. Cells
+        //    from a rootless (files-only) session have nowhere to park,
+        //    so they carry forward as `kept` like before.
+        let outgoing_root = self.current_project_root();
+        let preserve_all = outgoing_root.is_none();
+        let outgoing_focus = if let FocusId::Cell(i) = self.focus { Some(i) } else { None };
         let kept: Vec<Cell> = if preserve_all {
             std::mem::take(&mut self.cells)
         } else {
-            self.cells.clear();
+            let cells = std::mem::take(&mut self.cells);
+            if let Some(root) = outgoing_root {
+                self.parked_cells.insert(root, ParkedProject { cells, focus: outgoing_focus });
+            }
             Vec::new()
         };
         self.last_cell_focus = 0;
@@ -2490,15 +2840,24 @@ impl App {
         self.projects.refresh_states();
         let _ = self.projects.save();
 
-        // 4. Restore the incoming project's cells from its `.acedata`.
-        //    Missing file or empty snapshot → single scratch editor so
-        //    the session always has at least one cell.
-        let (restored, saved_focus) = match crate::session_state::load(root) {
-            Some(snap) => {
-                let f = snap.focus;
-                (self.restore_cells_from_snapshot(&snap), f)
+        // 4. Restore the incoming project's cells. Parked cells (still
+        //    alive from a prior switch) win over the disk snapshot —
+        //    that's what keeps shells/claude running in the background.
+        //    Falls back to `.acedata` when nothing is parked (first
+        //    switch this session).
+        let (restored, saved_focus) = if let Some(parked) = self.parked_cells.remove(root) {
+            let focus = parked.focus;
+            let n = parked.cells.len();
+            self.cells.extend(parked.cells);
+            (n, focus)
+        } else {
+            match crate::session_state::load(root) {
+                Some(snap) => {
+                    let f = snap.focus;
+                    (self.restore_cells_from_snapshot(&snap), f)
+                }
+                None => (0, None),
             }
-            None => (0, None),
         };
         // Re-insert preserved open-file cells. Only fall back to a
         // scratch editor if nothing survived and nothing was restored —
@@ -3643,6 +4002,69 @@ fn cell_active_editor_is_dirty(cell: &Cell) -> bool {
     matches!(cell.active_session(), Session::Edit(e) if e.dirty)
 }
 
+/// Spawn `sudo -S tee <path>` and feed it the password followed by the
+/// file content. Returns the first line of stderr on failure so the
+/// user sees "incorrect password" / "not in the sudoers file" instead
+/// of a bare non-zero exit code.
+///
+/// Uses `-S` (password on stdin) and `-p ""` (no prompt echo) so the
+/// only thing sudo writes to the tty is the password prompt we handle
+/// ourselves via the status bar.
+fn exec_sudo_write(path: &Path, content: &[u8], password: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let path_str = path.to_string_lossy().into_owned();
+    let mut child = Command::new("sudo")
+        .arg("-S")
+        .arg("-p").arg("")
+        .arg("tee")
+        .arg(&path_str)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn sudo: {e}"))?;
+    {
+        let stdin = child.stdin.as_mut().ok_or_else(|| "sudo: no stdin".to_string())?;
+        stdin.write_all(password.as_bytes()).map_err(|e| e.to_string())?;
+        stdin.write_all(b"\n").map_err(|e| e.to_string())?;
+        stdin.write_all(content).map_err(|e| e.to_string())?;
+    }
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let first = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("sudo failed");
+    Err(first.to_string())
+}
+
+/// Parse the sudo-prefixed / force-bang command shortcuts. Returns the
+/// sudo action to queue up (the password prompt opens after this
+/// returns `Some`). Aliases handled here:
+///   :sudo w             → Write
+///   :sudo wq | :sudo x  → WriteClose
+///   :sudo wQ            → WriteQuitApp
+///   :w!                 → Write
+///   :w!q                → WriteClose
+///   :x!                 → WriteClose
+pub fn parse_sudo_command(cmd: &str) -> Option<SudoAction> {
+    let trimmed = cmd.trim();
+    if let Some(rest) = trimmed.strip_prefix("sudo ") {
+        return match rest.trim() {
+            "w"  | "write"      => Some(SudoAction::Write),
+            "wq" | "x"          => Some(SudoAction::WriteClose),
+            "wQ"                => Some(SudoAction::WriteQuitApp),
+            _                   => None,
+        };
+    }
+    match trimmed {
+        "w!"         => Some(SudoAction::Write),
+        "w!q" | "x!" => Some(SudoAction::WriteClose),
+        _            => None,
+    }
+}
+
 /// A cell argument parsed from a command suffix.
 #[derive(Copy, Clone, Debug)]
 pub enum CellTarget {
@@ -3765,6 +4187,14 @@ JUMP MODE (after Space)
   1-9             focus cell N, leave jump mode
   Tab             cycle to next session in the focused cell (stay armed)
   Shift-Tab       cycle to previous session in the focused cell (stay armed)
+  s               swap mode — next digit swaps content (focus stays at slot)
+                    s 0     minimize focused cell
+                    s 1-9   swap focused ↔ cell N
+  m               move mode — next digit moves focused cell (focus follows)
+                    m 0     minimize focused cell
+                    m 1-9   move focused to slot N
+                    m <any> minimize focused cell (stand-alone)
+  q               quit the focused cell (same as `:q`)
   Space           leave jump mode
   anything else   leave jump mode (key is dropped)
 
@@ -3826,32 +4256,48 @@ EDITOR — SEARCH
   :nohl            clear highlight
 
 EX COMMANDS
-  :w  :w!          write focused editor / force over external conflict
+  :w               write focused editor
   :w <path>        save as (adopts the path). Used to name an unnamed
                    scratch buffer (`unknown [NEW]` → real file)
   :q  :q!          close focused cell / force-discard dirty buffer
   :wq  :x          write focused editor then close the focused cell
   :wQ  :wQ!        write focused editor then quit the whole app
+
+SUDO (root-owned files)
+  :sudo w          write focused editor via `sudo tee`; prompts for
+                   password in the status bar (input is masked)
+  :sudo wq         sudo-write then close focused cell
+  :sudo x          alias for :sudo wq
+  :sudo wQ         sudo-write then quit the whole app
+  :w!              shorthand for :sudo w
+  :w!q             shorthand for :sudo wq
+  :x!              shorthand for :sudo wq
+                   Esc in the password prompt cancels without spawning
+                   sudo. Requires `sudo` on PATH.
   :{N}             jump to line N
   :%s/old/new/g    whole-file literal substitute
   :e <path>        open file in focused cell (or new cell if not an editor).
                    Nonexistent paths open as a `[NEW]` buffer — `:w` creates
-                   the file on save.
+                   the file on save. `~/…` expands to the home directory.
   :e!              reload from disk (discard buffer)
   :new kind [path] new cell: shell | claude | edit [path]
+                   `:new shell <exec>` runs <exec> instead of the default
+                   shell (e.g. `:new shell zsh`, `:new shell \"bash -i\"`).
+  :c  :claude      shorthand for `:new claude`
+  :s  :shell       shorthand for `:new shell`; `:shell <exec>` runs <exec>
   :tab kind [path] new session in the focused cell (tabbed)
   :split           split current cell's sessions into their own cells
   :conflict        3-way merge view for a modified-on-disk file
   :proj <name>     switch project by name
-  :proj add <dir>  add a project
+  :proj add <dir>  add a project (accepts `~/…` for the home dir)
   :proj rm  <name> close a project
   :git             open git overview in the explorer
   :layout <name>   master-bottom | mb | master-right | mr (default set in .acerc)
-  :swap N          swap focused cell with cell N (1..9).
-                   Ctrl+Space      arms swap, focus stays put
-                   Ctrl+Alt+Space  arms swap, focus follows content
-                   Ctrl+Space then 0 (or `:swap 0`, `:min`) minimizes.
+  :swap N          swap focused cell with cell N (1..9). Shorthand for
+                   the `Space s N` / `Space m N` chords.
   :min :minimize   hide focused cell; it stays live in Open Cells.
+  :min N           minimize cell N (1..9) without focusing it.
+  :min *           minimize every cell except the focused one.
   :restore N       un-hide cell N and focus it (space+N does the same).
   :set wrap        soft-wrap long lines in the focused editor
   :set nowrap      horizontal scroll instead of wrapping
@@ -3861,9 +4307,10 @@ EX COMMANDS
   :Q  :Q!          quit the app / force-quit with dirty buffers
 
 CELL TARGETS
-  Any of :q :q! :w :w! :wq :x :close :bd :bd! accept a trailing
+  Any of :q :q! :w :wq :x :close :bd :bd! accept a trailing
   cell number or `*` — `:q 3` closes cell 3, `:w *` saves every editor,
-  `:wq *` writes all then closes all.
+  `:wq *` writes all then closes all. (Sudo variants act on the
+  focused cell only.)
 
 EXPLORER — NORMAL
   j  k            move cursor
@@ -3881,14 +4328,28 @@ TITLE BADGES
   [SHELL]         shell PTY cell                        (amber)
   [ACodeEditor]   built-in buffer (help, welcome)       (purple)
   [NEW]           file doesn't exist on disk yet        (green)
-  [EXTERNAL]      editor file is outside the project    (blue)
+  [CONFLICT]      on-disk file changed externally       (red)
+  [DELETED]       on-disk file was removed externally   (red)
+  [EXTERNAL]      editor file is outside the project    (amber)
+
+BORDER COLOURS (focused pane)
+  Normal          cyan       default mode
+  Insert          green      editor / PTY insert mode
+  Visual          magenta    editor visual selection
+  Git overview    green      explorer in a git sub-mode overview / log
+  Git branches    purple     explorer cursor in the branches list
+  Git changes     orange     explorer cursor in the changes list
 
 CLI
   ace                         welcome / global list / cwd-only (see `.acerc`)
   ace <dir> [<dir>…]          open those as projects
   ace <file> [<file>…]        one editor cell per file (nonexistent → [NEW])
+  ace --update [<tag>]        update ace in place (latest release or a
+                              specific tag, e.g. `ace --update v0.2.0`).
+                              Runs the cargo-dist installer for this OS.
+  ace --version               print version and exit
 
-~/.acerc
+~/.acerc   (key = value, spaces around `=` optional — `key=value` also works)
   shell     = \"powershell -NoLogo\"   # shell cell argv
   claude    = \"claude\"               # claude cell argv
   claude_skip_permissions = true
@@ -3896,6 +4357,10 @@ CLI
                                      #   \"welcome\" (default) — landing page
                                      #   \"cwd\"               — cwd as sole project
                                      #   \"global\"            — saved project list
+  layout    = \"master-bottom\"        # default cell tiling
+  auto_gitignore = true              # inject .acedata / .acerc into a
+                                     # project's .gitignore on first save;
+                                     # set to false to opt out
 
 GIT — EXPLORER SUB-MODES
   g               overview  (Esc: back to Normal)

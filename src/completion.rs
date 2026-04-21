@@ -57,17 +57,22 @@ const TOP_LEVEL: &[&str] = &[
     "min", "minimize",
     "restore",
     "split",
+    "sudo",
     "swap",
     "tab",
-    "w", "w!", "write", "write!",
-    "wq", "wQ", "wQ!", "x",
+    "w", "w!", "w!q", "write", "write!",
+    "wq", "wQ", "wQ!", "x", "x!",
 ];
+
+/// `:sudo <sub>` sub-commands. Matches the set that `parse_sudo_command`
+/// in app.rs accepts, minus the bang aliases (those live at top level).
+const SUDO_SUBS: &[&str] = &["w", "wq", "wQ", "x"];
 
 /// Public entry point.
 pub fn complete(buffer: &str, ctx: &CompletionCtx) -> Completion {
     if buffer.is_empty() { return Completion::default(); }
     // Search prompts (`/pat` / `?pat`) are free-text — no completion.
-    let first = buffer.chars().next().unwrap();
+    let Some(first) = buffer.chars().next() else { return Completion::default(); };
     if first == '/' || first == '?' { return Completion::default(); }
     // Plain `:42` — numeric goto, nothing to complete.
     if buffer.chars().all(|c| c.is_ascii_digit()) { return Completion::default(); }
@@ -124,6 +129,10 @@ pub fn complete(buffer: &str, ctx: &CompletionCtx) -> Completion {
         "proj" | "project" | "projects" => complete_proj(&args, token, token_start, ctx),
 
         "git" => complete_git(&args, token, token_start, ctx),
+
+        // `:sudo <sub>` — only the first arg is suggested; the sub-command
+        // itself doesn't take a path (the focused editor's path is used).
+        "sudo" if args.is_empty() => starts_with_into(SUDO_SUBS, token, token_start),
 
         _ => Completion::default(),
     }
