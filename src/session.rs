@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -69,7 +70,36 @@ pub struct PtySession {
     /// main loop polls this to reap the cell so a dead shell/claude
     /// doesn't leave a zombie pane.
     exited: Arc<AtomicBool>,
+    /// Epoch-millis of the last byte received from the PTY child.
+    /// Bumped by the reader thread on every read. `is_busy()` uses this
+    /// to decide whether `:q` should refuse (running command / Claude
+    /// spinner) and require `:q!` instead.
+    last_output_ms: Arc<AtomicU64>,
+    /// OS pid of the shell/claude process we spawned. Used by
+    /// `is_busy()` to detect silent long-running children (e.g. a dev
+    /// server waiting for file changes): if the shell has any
+    /// descendant processes still alive, something is running even if
+    /// no output is flowing. `None` when portable-pty couldn't hand us
+    /// a pid (rare — usually a spawn race).
+    child_pid: Option<u32>,
+    /// Epoch-millis the child process was spawned — used to skip the
+    /// descendant check during the first `BUSY_BASELINE_MS` window so
+    /// we can capture an idle-state baseline before claiming busy.
+    spawn_ms: u64,
+    /// Descendant count captured after the startup window elapses.
+    /// `usize::MAX` means "not captured yet." The busy check compares
+    /// the current descendant count against this and only flags busy
+    /// when there are *additional* descendants — required because
+    /// wrappers like Git Bash's `bin/bash.exe` launch an inner bash
+    /// that permanently sits as a descendant even when idle.
+    baseline_descendants: AtomicUsize,
 }
+
+/// Delay after spawn before we trust the descendant-count baseline.
+/// Short enough that a user can't easily start a command in the window;
+/// long enough that shell wrappers (Git Bash launcher → inner bash)
+/// have settled into their steady-state process tree.
+const BUSY_BASELINE_MS: u64 = 1500;
 
 impl PtySession {
     pub fn spawn_shell(rows: u16, cols: u16, cwd: Option<&Path>, tx: Sender<AppEvent>) -> Result<Self> {
@@ -94,6 +124,28 @@ impl PtySession {
         Self::spawn(rows, cols, program, cmd, tx)
     }
 
+    /// Spawn a one-shot command line through the user's configured
+    /// shell (`.acerc` `shell = ...`), falling back to `powershell` on
+    /// Windows and `sh` elsewhere. The right "run this string" flag
+    /// (`-c`, `-Command`, `/C`) is inferred from the program's basename.
+    /// The PTY exits as soon as the command does, which lets the main
+    /// loop reap the cell automatically. Backing for `:ex <cmd>`.
+    pub fn spawn_exec(
+        cmdline: &str,
+        rows: u16,
+        cols: u16,
+        cwd: Option<&Path>,
+        tx: Sender<AppEvent>,
+    ) -> Result<Self> {
+        let mut argv = crate::config::Config::load()
+            .shell
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(exec_fallback_argv);
+        argv.push(exec_flag_for(&argv[0]).to_string());
+        argv.push(cmdline.to_string());
+        Self::spawn_shell_custom(argv, rows, cols, cwd, tx)
+    }
+
     pub fn spawn_claude(rows: u16, cols: u16, cwd: Option<&Path>, tx: Sender<AppEvent>) -> Result<Self> {
         let (program, mut cmd) = default_claude_command();
         apply_cwd(&mut cmd, cwd);
@@ -105,6 +157,56 @@ impl PtySession {
     /// on the next iteration.
     pub fn has_exited(&self) -> bool {
         self.exited.load(Ordering::Relaxed)
+    }
+
+    /// Rough "is something actively running in this PTY" heuristic.
+    /// True iff the child hasn't exited AND either:
+    ///   * the child produced output in the last 500ms (Claude
+    ///     spinner, streaming build, prompt redraw), or
+    ///   * the shell has at least one live descendant process (a
+    ///     silent dev server like `npm run dev` waiting on FS events,
+    ///     a `sleep`, a command blocked on stdin).
+    ///
+    /// The descendant check is what catches the "silent but running"
+    /// case output-recency alone misses. Used by `:q` / `:Q` to refuse
+    /// closing a cell while work is in flight (forcing `:q!`).
+    pub fn is_busy(&self) -> bool {
+        if self.has_exited() { return false; }
+        let last = self.last_output_ms.load(Ordering::Relaxed);
+        if last != 0 && now_ms().saturating_sub(last) < 500 {
+            return true;
+        }
+        self.has_live_descendants()
+    }
+
+    /// True when the shell process has one or more descendant
+    /// processes alive (children, grandchildren, etc.). Walks the
+    /// full process table once and follows parent pids transitively,
+    /// which is the only cross-platform way to catch double-forked
+    /// daemons — a `node` spawned by `npm` whose direct parent is a
+    /// helper process, etc.
+    ///
+    /// Returns `false` if we don't have a pid (spawn race) or if
+    /// sysinfo can't enumerate (shouldn't happen on supported
+    /// platforms). False negatives are preferable to false positives
+    /// here — a stuck `:q` is worse than closing a truly idle shell.
+    fn has_live_descendants(&self) -> bool {
+        let Some(root) = self.child_pid else { return false; };
+        // Startup window: don't trust the baseline yet. Return false so
+        // the user can actually close a freshly-opened shell without
+        // waiting. Once the window elapses, capture the steady-state
+        // count as the baseline and use it from then on.
+        let elapsed = now_ms().saturating_sub(self.spawn_ms);
+        if elapsed < BUSY_BASELINE_MS {
+            return false;
+        }
+        let current = count_real_descendants(root);
+        let baseline = self.baseline_descendants.load(Ordering::Relaxed);
+        if baseline == usize::MAX {
+            self.baseline_descendants.store(current, Ordering::Relaxed);
+            return false;
+        }
+        current > baseline
     }
 
     fn spawn(
@@ -124,6 +226,7 @@ impl PtySession {
 
         let mut child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
+        let child_pid = child.process_id();
 
         // `SCROLLBACK_CAP` lines of scrollback — plenty for normal shell
         // usage while keeping memory bounded per cell.
@@ -132,12 +235,14 @@ impl PtySession {
 
         // Reader thread: PTY output → parser → redraw signal,
         // also handles the ConPTY DSR/handshake replies.
-        let reader       = pair.master.try_clone_reader()?;
-        let parser_clone = Arc::clone(&parser);
-        let tx_clone     = tx.clone();
-        let writer_clone = Arc::clone(&writer);
+        let reader          = pair.master.try_clone_reader()?;
+        let parser_clone    = Arc::clone(&parser);
+        let tx_clone        = tx.clone();
+        let writer_clone    = Arc::clone(&writer);
+        let last_output_ms  = Arc::new(AtomicU64::new(0));
+        let last_output_rd  = Arc::clone(&last_output_ms);
         thread::spawn(move || {
-            pty_reader_loop(reader, parser_clone, tx_clone, writer_clone);
+            pty_reader_loop(reader, parser_clone, tx_clone, writer_clone, last_output_rd);
         });
 
         // Waiter thread: owns the Child so it doesn't become a zombie.
@@ -168,6 +273,10 @@ impl PtySession {
             last_ring_len: AtomicUsize::new(0),
             last_scrollback_offset: AtomicUsize::new(0),
             exited,
+            last_output_ms,
+            child_pid,
+            spawn_ms: now_ms(),
+            baseline_descendants: AtomicUsize::new(usize::MAX),
         })
     }
 
@@ -207,6 +316,28 @@ impl PtySession {
             .lock()
             .map(|p| p.screen().title().to_string())
             .unwrap_or_default()
+    }
+
+    /// Last non-empty line currently on screen, trimmed. Walks from the
+    /// bottom row upward and returns the first row with visible content.
+    /// Used by `:ex` to surface command output to the status bar.
+    pub fn last_nonempty_line(&self) -> Option<String> {
+        let p = self.parser.lock().ok()?;
+        let screen = p.screen();
+        let (rows, cols) = screen.size();
+        for r in (0..rows).rev() {
+            let mut line = String::new();
+            for c in 0..cols {
+                if let Some(cell) = screen.cell(r, c) {
+                    line.push_str(&cell.contents());
+                }
+            }
+            let trimmed = line.trim_end();
+            if !trimmed.is_empty() {
+                return Some(trimmed.trim_start().to_string());
+            }
+        }
+        None
     }
 
     pub fn scroll_reset(&self) {
@@ -611,6 +742,7 @@ fn pty_reader_loop(
     parser: Arc<Mutex<vt100::Parser>>,
     tx: Sender<AppEvent>,
     writer: SharedWriter,
+    last_output_ms: Arc<AtomicU64>,
 ) {
     let mut buf = [0u8; 4096];
     loop {
@@ -630,6 +762,7 @@ fn pty_reader_loop(
                 if let Ok(mut p) = parser.lock() {
                     p.process(&buf[..n]);
                 }
+                last_output_ms.store(now_ms(), Ordering::Relaxed);
                 if tx.send(AppEvent::Redraw).is_err() {
                     break;
                 }
@@ -638,6 +771,61 @@ fn pty_reader_loop(
         }
     }
     let _ = tx.send(AppEvent::Redraw);
+}
+
+/// Names of processes ConPTY (Windows) attaches to every pseudoterminal
+/// for console-host emulation. These persist for the pty's lifetime
+/// regardless of whether the user is running anything, so the busy
+/// heuristic must ignore them. Matched case-insensitively, with or
+/// without the `.exe` suffix depending on how sysinfo reports it.
+fn is_pty_host_helper(name: &str) -> bool {
+    let stem = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches(".exe")
+        .trim_end_matches(".EXE");
+    stem.eq_ignore_ascii_case("conhost") || stem.eq_ignore_ascii_case("openconsole")
+}
+
+/// Number of descendant processes of `root` that aren't ConPTY
+/// console-host helpers. Walks the full process table once and
+/// expands the "ours" set transitively by parent pid, so double-
+/// forked children are included. Returns 0 on any sysinfo failure
+/// (safer to under-report than to over-report busy).
+fn count_real_descendants(root: u32) -> usize {
+    use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
+    let sys = System::new_with_specifics(
+        RefreshKind::new().with_processes(ProcessRefreshKind::new()),
+    );
+    let root_pid = Pid::from_u32(root);
+    let mut ours: std::collections::HashSet<Pid> = std::collections::HashSet::new();
+    ours.insert(root_pid);
+    loop {
+        let mut added = false;
+        for (pid, proc) in sys.processes() {
+            if ours.contains(pid) { continue; }
+            if let Some(ppid) = proc.parent() {
+                if ours.contains(&ppid) {
+                    ours.insert(*pid);
+                    added = true;
+                }
+            }
+        }
+        if !added { break; }
+    }
+    ours.iter().filter(|pid| {
+        if **pid == root_pid { return false; }
+        let Some(proc) = sys.process(**pid) else { return false; };
+        !is_pty_host_helper(proc.name().to_string_lossy().as_ref())
+    }).count()
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Scan incoming bytes for terminal queries that expect a host reply
@@ -711,6 +899,33 @@ fn platform_default_shell() -> (String, CommandBuilder) {
     let mut cmd = CommandBuilder::new(&shell);
     apply_common_env(&mut cmd);
     (shell, cmd)
+}
+
+/// Fallback argv for `:ex` when the user hasn't configured a shell:
+/// `powershell` on Windows, `sh` elsewhere. Deliberately distinct from
+/// `platform_default_shell` — `:ex` wants a minimal "run this string"
+/// shell, not necessarily the user's interactive one.
+fn exec_fallback_argv() -> Vec<String> {
+    #[cfg(windows)]
+    { vec!["powershell".into(), "-NoLogo".into()] }
+    #[cfg(not(windows))]
+    { vec!["sh".into()] }
+}
+
+/// Pick the "run this string" flag appropriate to the shell's basename.
+/// powershell/pwsh use `-Command`; cmd uses `/C`; everything else gets
+/// the POSIX `-c`.
+fn exec_flag_for(program: &str) -> &'static str {
+    let base = std::path::Path::new(program)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    match base.as_str() {
+        "powershell" | "pwsh" => "-Command",
+        "cmd"                 => "/C",
+        _                     => "-c",
+    }
 }
 
 fn apply_common_env(cmd: &mut CommandBuilder) {

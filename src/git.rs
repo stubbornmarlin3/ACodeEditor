@@ -162,7 +162,8 @@ impl GitSnapshot {
         let mut opts = StatusOptions::new();
         opts.include_untracked(true)
             .recurse_untracked_dirs(true)
-            .include_ignored(false)
+            .include_ignored(true)
+            .recurse_ignored_dirs(false)
             .exclude_submodules(true)
             // Rename detection is off by default in libgit2 — without
             // these flags INDEX_RENAMED / WT_RENAMED bits are never set
@@ -238,7 +239,15 @@ impl GitSnapshot {
         let wd  = self.workdir.as_ref()?;
         let rel = abs_path.strip_prefix(wd).ok()?;
         let key = rel.to_string_lossy().replace('\\', "/");
-        self.statuses.get(&key).copied().map(classify_tree)
+        if let Some(s) = self.statuses.get(&key).copied().map(classify_tree) {
+            return Some(s);
+        }
+        // libgit2 reports ignored directories as a single entry
+        // (`recurse_ignored_dirs(false)`) so files *inside* an ignored
+        // dir don't appear in `statuses`. Walk up the key's ancestors
+        // — if any is marked Ignored in `dir_statuses`, the path
+        // inherits the ignored tint.
+        ancestor_ignored(&key, &self.dir_statuses)
     }
 
     /// Flat, grouped list of changed files for the git pane's changes
@@ -320,9 +329,248 @@ impl GitSnapshot {
         let wd  = self.workdir.as_ref()?;
         let rel = abs_dir.strip_prefix(wd).ok()?;
         let rel_slash = rel.to_string_lossy().replace('\\', "/");
-        self.dir_statuses.get(rel_slash.as_str()).copied()
+        if let Some(s) = self.dir_statuses.get(rel_slash.as_str()).copied() {
+            return Some(s);
+        }
+        // Same inheritance rule as `status_for`: a child of an
+        // ignored directory gets the ignored tint even though
+        // libgit2 didn't enumerate it.
+        ancestor_ignored(&rel_slash, &self.dir_statuses)
     }
 
+}
+
+/// Walk the ancestor chain of `rel_slash` in `dir_statuses` looking
+/// for an Ignored marker. Returns `Some(Ignored)` if any ancestor is
+/// marked ignored, else `None`. The `key` itself is not checked — the
+/// caller already looked it up.
+fn ancestor_ignored(
+    rel_slash: &str,
+    dir_statuses: &HashMap<String, FileStatus>,
+) -> Option<FileStatus> {
+    let mut cursor = rel_slash;
+    while let Some(i) = cursor.rfind('/') {
+        cursor = &cursor[..i];
+        if let Some(FileStatus::Ignored) = dir_statuses.get(cursor).copied() {
+            return Some(FileStatus::Ignored);
+        }
+    }
+    None
+}
+
+/// Multi-repo view of the active project: zero or more discovered git
+/// repositories, with one marked active for single-repo UI (expanded
+/// git mode, commands). Tinting and footer rendering iterate all
+/// repos; longest-prefix match on `workdir` routes a file/dir path to
+/// its owning repo.
+pub struct MultiRepo {
+    pub repos:  Vec<GitSnapshot>,
+    /// Index into `repos` for expanded git mode + command targeting.
+    /// Meaningless when `repos` is empty.
+    pub active: usize,
+    /// Project root that repos were discovered under. Used by the UI
+    /// to format "root" vs nested repo labels.
+    pub project_root: Option<PathBuf>,
+    /// Fallback target for `Deref` when `repos` is empty so existing
+    /// code can keep reading `app.git.<field>` without an `Option`
+    /// shuffle. Never mutated after construction.
+    empty_snap: GitSnapshot,
+}
+
+impl std::ops::Deref for MultiRepo {
+    type Target = GitSnapshot;
+    /// Single-repo fields (`branch`, `ahead`, `op_state`, `branches`,
+    /// `change_rows()`, …) read through to the active repo. Methods
+    /// that must aggregate across repos (`is_repo`, `status_for`,
+    /// `dir_status`) live as inherent methods on `MultiRepo` and
+    /// shadow the `GitSnapshot` versions by name-resolution order.
+    fn deref(&self) -> &GitSnapshot {
+        self.repos.get(self.active).unwrap_or(&self.empty_snap)
+    }
+}
+
+#[allow(dead_code)]
+impl MultiRepo {
+    pub fn empty() -> Self {
+        Self {
+            repos: Vec::new(),
+            active: 0,
+            project_root: None,
+            empty_snap: GitSnapshot::empty(),
+        }
+    }
+
+    /// Discover every git repo reachable from `project_root`: the root
+    /// itself (if it's a repo), plus any nested repos under it. Done
+    /// in two passes to keep the per-repo cost visible and avoidable:
+    ///
+    ///   1. Cheap path walk that lists candidate repo roots — anywhere
+    ///      we can find a `.git` that `Repository::open` accepts as a
+    ///      repo root at that exact path. `open` (unlike `discover`)
+    ///      refuses to walk up, so we never accidentally pick up an
+    ///      ancestor's `.git` for a non-repo subdirectory.
+    ///
+    ///   2. One full `GitSnapshot::load` per accepted root for the UI
+    ///      (branch, counts, statuses). This is the expensive part.
+    ///
+    /// Hidden directories (leading `.`) and common heavy build outputs
+    /// are skipped so deep, irrelevant trees don't dominate the walk.
+    pub fn discover(project_root: &Path) -> Self {
+        let roots = find_repo_roots(project_root);
+        let repos: Vec<GitSnapshot> = roots.iter()
+            .map(|p| GitSnapshot::load(p))
+            .collect();
+        Self {
+            repos,
+            active: 0,
+            project_root: Some(project_root.to_path_buf()),
+            empty_snap: GitSnapshot::empty(),
+        }
+    }
+
+    pub fn is_repo(&self) -> bool {
+        !self.repos.is_empty()
+    }
+
+    /// Borrow the repo currently targeted by single-repo UI (branches,
+    /// commit, changes list). `None` when no repos are present.
+    pub fn active(&self) -> Option<&GitSnapshot> {
+        self.repos.get(self.active)
+    }
+
+    /// Advance `active` by one (forward or backward) modulo the repo
+    /// count. No-op with 0 or 1 repos.
+    pub fn cycle(&mut self, forward: bool) {
+        let n = self.repos.len();
+        if n < 2 { return; }
+        self.active = if forward {
+            (self.active + 1) % n
+        } else {
+            (self.active + n - 1) % n
+        };
+    }
+
+    /// Locate the repo that owns `abs_path` — the one whose `workdir`
+    /// is the longest prefix. Returns both the repo and its index so
+    /// callers can e.g. look up the repo's label in parallel.
+    fn owning_repo(&self, abs_path: &Path) -> Option<(usize, &GitSnapshot)> {
+        let mut best: Option<(usize, &GitSnapshot, usize)> = None;
+        for (i, r) in self.repos.iter().enumerate() {
+            let Some(wd) = r.workdir.as_ref() else { continue; };
+            if abs_path.starts_with(wd) {
+                let len = wd.as_os_str().len();
+                if best.map(|(_, _, bl)| len > bl).unwrap_or(true) {
+                    best = Some((i, r, len));
+                }
+            }
+        }
+        best.map(|(i, r, _)| (i, r))
+    }
+
+    /// Like `GitSnapshot::status_for`, but routes to whichever repo
+    /// owns the path. Returns `None` when no repo claims the path.
+    pub fn status_for(&self, abs_path: &Path) -> Option<FileStatus> {
+        let (_, repo) = self.owning_repo(abs_path)?;
+        repo.status_for(abs_path)
+    }
+
+    /// Like `GitSnapshot::dir_status`, same routing rule.
+    pub fn dir_status(&self, abs_dir: &Path) -> Option<FileStatus> {
+        let (_, repo) = self.owning_repo(abs_dir)?;
+        repo.dir_status(abs_dir)
+    }
+
+    /// True if `abs_dir` is the workdir of one of the discovered
+    /// repos. Used by the explorer to know which folder rows should
+    /// get a status dot next to them.
+    pub fn repo_at(&self, abs_dir: &Path) -> Option<&GitSnapshot> {
+        self.repos.iter().find(|r| r.workdir.as_ref()
+            .map(|w| paths_equal(w, abs_dir))
+            .unwrap_or(false))
+    }
+
+    /// The repo (if any) whose workdir is the project root itself —
+    /// distinct from nested repos under the project. Used by the
+    /// project header dot: a project with only nested repos gets no
+    /// header dot, because the project root isn't itself a repo.
+    pub fn root_repo(&self) -> Option<&GitSnapshot> {
+        let pr = self.project_root.as_ref()?;
+        self.repo_at(pr)
+    }
+}
+
+/// First pass of `MultiRepo::discover`: walk the tree and collect
+/// candidate repo roots. "Repo root at path P" means `Repository::open(P)`
+/// succeeds — that function refuses to walk up, so anything it accepts
+/// has its `.git` right there and isn't just an ancestor's repo.
+///
+/// Depth-capped and heavy-dir-skipped so this stays responsive on
+/// sprawling trees. Repeats against small symlink cycles are handled
+/// implicitly by the depth cap.
+fn find_repo_roots(project_root: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if is_repo_root(project_root) {
+        out.push(project_root.to_path_buf());
+    }
+    let mut stack: Vec<(PathBuf, u8)> = vec![(project_root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth >= 8 { continue; }
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue; };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
+                || path.is_dir(); // OneDrive cloud-only placeholders can
+                                  // report as files for file_type() but
+                                  // still list as directories — double
+                                  // check with the slower path probe so
+                                  // nested repos inside such folders
+                                  // aren't missed.
+            if !is_dir { continue; }
+            let name = match path.file_name().and_then(|s| s.to_str()) {
+                Some(n) => n,
+                None    => continue,
+            };
+            if name.starts_with('.') { continue; }
+            if matches!(name, "node_modules" | "target" | "dist" | "build") {
+                continue;
+            }
+            if is_repo_root(&path) {
+                out.push(path);
+                // Don't recurse — a nested repo manages its own tree,
+                // and its files shouldn't be re-enumerated by the parent.
+                continue;
+            }
+            stack.push((path, depth + 1));
+        }
+    }
+    out
+}
+
+/// Is `path` the root of a git repo — that is, is there a `.git` here
+/// (directory or gitlink file) and does libgit2 open it without
+/// walking up? `Repository::open` (not `discover`) is the strict
+/// check; it refuses ancestors.
+fn is_repo_root(path: &Path) -> bool {
+    if !path.join(".git").exists() { return false; }
+    Repository::open(path).is_ok()
+}
+
+pub fn paths_equal(a: &Path, b: &Path) -> bool {
+    // Normalise for comparison — libgit2's `workdir()` returns paths
+    // with forward slashes *and* a trailing slash on Windows, while
+    // `std::fs` entries use backslashes and no trailing slash.
+    // Swapping one for the other is a lossy transform for display but
+    // safe for equality.
+    fn norm(p: &Path) -> String {
+        let s = p.to_string_lossy().replace('\\', "/");
+        s.trim_end_matches('/').to_string()
+    }
+    let a = norm(a);
+    let b = norm(b);
+    #[cfg(windows)]
+    { a.eq_ignore_ascii_case(&b) }
+    #[cfg(not(windows))]
+    { a == b }
 }
 
 /// Walk every status entry once and bubble its classification up through
@@ -332,6 +580,23 @@ fn build_dir_statuses(statuses: &HashMap<String, Status>) -> HashMap<String, Fil
     let mut out: HashMap<String, FileStatus> = HashMap::new();
     for (path, flags) in statuses {
         let s = classify_tree(*flags);
+        // libgit2 reports ignored directories as a single entry (e.g.
+        // "target/") thanks to `recurse_ignored_dirs(false)`. Tag the
+        // path itself so `dir_status("target")` returns Ignored even
+        // though no child files were enumerated. Trailing slash is
+        // stripped to match how the explorer keys paths.
+        let self_key = path.trim_end_matches('/');
+        if !self_key.is_empty() {
+            merge_dir_status(&mut out, self_key, s);
+        }
+        // Ignored entries tag themselves (so e.g. `target/` reads
+        // grey) but don't bubble up. Otherwise a clean folder that
+        // happens to contain an ignored `target/` would render
+        // ignored-grey too, which reads as "this whole folder is
+        // out of scope" when really only one child is.
+        if s == FileStatus::Ignored {
+            continue;
+        }
         // The file's own parent chain: for "a/b/c.txt" that's "a/b", "a", "".
         let mut cursor = path.as_str();
         loop {

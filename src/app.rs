@@ -6,7 +6,7 @@ use crate::cell::{Cell, LayoutMode, Session, SessionKind};
 use crate::editor::Editor;
 use crate::events::AppEvent;
 use crate::explorer::FileTree;
-use crate::git::{self, ChangeRow, GitSnapshot};
+use crate::git::{self, ChangeRow, MultiRepo};
 use crate::projects::ProjectList;
 use crate::session_state::{CellState, SessionState, StateSnapshot};
 use crate::status::StatusBar;
@@ -263,6 +263,9 @@ pub enum PendingConfirm {
     /// after it's dropped (reflog sticks around for a while, but
     /// relying on that isn't obvious to most users).
     StashDrop { idx: usize },
+    /// `d` on a file/dir in the explorer — removes it from disk.
+    /// Directories are deleted recursively.
+    DeletePath { path: PathBuf, is_dir: bool },
 }
 
 impl PendingConfirm {
@@ -284,6 +287,13 @@ impl PendingConfirm {
             }
             PendingConfirm::StashDrop { idx } =>
                 format!("drop stash@{{{idx}}}? [y/N]"),
+            PendingConfirm::DeletePath { path, is_dir } => {
+                let name = path.file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                let kind = if *is_dir { "directory" } else { "file" };
+                format!("delete {kind} {name}? [y/N]")
+            }
         }
     }
 }
@@ -305,7 +315,7 @@ pub struct App {
     pub pending_swap_follow: bool,
     pub mode: Mode,
     pub theme: Theme,
-    pub git: GitSnapshot,
+    pub git: MultiRepo,
     pub tray_count: u32,
     pub should_quit: bool,
     pub status: StatusBar,
@@ -465,7 +475,7 @@ impl App {
             let _ = std::env::set_current_dir(&dir);
         }
         let git_cwd = std::env::current_dir().unwrap_or_else(|_| cwd.clone());
-        let git = GitSnapshot::load(&git_cwd);
+        let git = MultiRepo::discover(&git_cwd);
         // Cells aren't populated yet — spawn_initial_cells runs after
         // App::new. The caller refreshes the explorer with real cell
         // counts once that's done.
@@ -528,19 +538,41 @@ impl App {
     pub fn refresh_git(&mut self) {
         let cwd = self.current_project_root()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
-        self.git = GitSnapshot::load(&cwd);
+        // Preserve the user's active-repo cursor across refreshes so a
+        // background reload mid-session doesn't snap back to repo 0.
+        // Stays valid as long as the repo set is stable; otherwise
+        // `clamp_git_cursors` below trims it.
+        let prev_active = self.git.active;
+        self.git = MultiRepo::discover(&cwd);
+        if prev_active < self.git.repos.len() {
+            self.git.active = prev_active;
+        }
         self.clamp_git_cursors();
     }
 
-    /// Apply a snapshot delivered by the background refresh thread.
-    pub fn set_git_snapshot(&mut self, snap: GitSnapshot) {
-        self.git = snap;
-        self.clamp_git_cursors();
+    /// Apply a fresh single-repo snapshot delivered by the background
+    /// refresh thread. Matches the snapshot's workdir against our
+    /// existing `MultiRepo.repos` and replaces that slot so nested-repo
+    /// state stays stable between ticks. If no match, drops the update
+    /// — that means the active project or the repo set shifted and
+    /// an explicit `refresh_git` will catch up.
+    pub fn set_git_snapshot(&mut self, snap: crate::git::GitSnapshot) {
+        let Some(wd) = snap.workdir.clone() else { return; };
+        for r in self.git.repos.iter_mut() {
+            let matches = r.workdir.as_ref()
+                .map(|existing| crate::git::paths_equal(existing, &wd))
+                .unwrap_or(false);
+            if matches {
+                *r = snap;
+                self.clamp_git_cursors();
+                return;
+            }
+        }
     }
 
     /// Clamp branch / change cursors after a snapshot swap so stale
     /// indices can't point past the end of the newly loaded lists.
-    fn clamp_git_cursors(&mut self) {
+    pub fn clamp_git_cursors(&mut self) {
         let n_branches = self.git.branches.len();
         if self.git_branch_sel >= n_branches {
             self.git_branch_sel = n_branches.saturating_sub(1);
@@ -985,6 +1017,44 @@ impl App {
         }
     }
 
+    /// Cycle through every repo discovered across every project. Used
+    /// by PgUp/PgDn while inside a git sub-mode — the REPOSITORIES
+    /// list shows all of them, so this matches. When the next repo
+    /// lives in a different project, switches that project active as
+    /// a side-effect, then points `app.git.active` at the right repo.
+    pub fn repo_jump_global(&mut self, forward: bool) {
+        // Flat list of (proj_idx, repo_idx) — the same order the
+        // REPOSITORIES header renders in.
+        let flat: Vec<(usize, usize)> = self.projects.projects.iter().enumerate()
+            .flat_map(|(pi, p)| (0..p.repos.len()).map(move |ri| (pi, ri)))
+            .collect();
+        if flat.is_empty() { return; }
+
+        let cur = self.projects.active;
+        let cur_repo = self.git.active;
+        let cur_pos = flat.iter()
+            .position(|&(pi, ri)| pi == cur && ri == cur_repo)
+            .unwrap_or(0);
+        let next_pos = if forward {
+            (cur_pos + 1) % flat.len()
+        } else {
+            (cur_pos + flat.len() - 1) % flat.len()
+        };
+        if next_pos == cur_pos { return; }
+        let (next_proj, next_repo) = flat[next_pos];
+        if next_proj != cur {
+            // Crosses a project boundary — do a full project switch so
+            // the file tree, footer, and parked-cells machinery all
+            // catch up. `project_switch_idx_keep_focus` rebuilds
+            // `app.git` via `refresh_git`, so we set `active` after.
+            self.project_switch_idx_keep_focus(next_proj);
+        }
+        if next_repo < self.git.repos.len() {
+            self.git.active = next_repo;
+            self.clamp_git_cursors();
+        }
+    }
+
     // ── mode entry points ────────────────────────────────────────────────
 
     pub fn enter_insert(&mut self) {
@@ -1418,6 +1488,11 @@ impl App {
                     self.cmd_new(&format!("shell {rest}"));
                 }
             }
+            "ex" | "execute" => self.status.push_auto("usage: :ex <cmd>".into()),
+            _ if cmd.starts_with("ex ") || cmd.starts_with("execute ") => {
+                let rest = cmd.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
+                self.cmd_execute(rest);
+            }
             _ if cmd.starts_with("tab ") => {
                 let rest = cmd.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
                 self.cmd_tab(rest);
@@ -1460,16 +1535,40 @@ impl App {
                         // Nudge any editor on the same file so it picks
                         // up the resolved content instead of flagging a
                         // conflict from the very write we just made.
-                        for c in self.cells.iter_mut() {
+                        // Remember the first matching editor cell — we
+                        // return focus there once the conflict cell is
+                        // gone, so the user lands back where they came
+                        // from.
+                        let mut editor_cell_idx: Option<usize> = None;
+                        for (ci, c) in self.cells.iter_mut().enumerate() {
                             for s in c.sessions.iter_mut() {
                                 if let Session::Edit(ed) = s {
                                     if ed.path.as_deref() == Some(path_clone.as_path()) {
                                         let _ = ed.reload_from_disk();
+                                        if editor_cell_idx.is_none() {
+                                            editor_cell_idx = Some(ci);
+                                        }
                                     }
                                 }
                             }
                         }
                         self.status.push_auto(msg);
+                        // Close the conflict cell and hand focus back to
+                        // the originating editor cell (if any). Resolving
+                        // a conflict is a one-way trip — keeping the
+                        // conflict view open after save just forces the
+                        // user to `:q` it themselves.
+                        if let FocusId::Cell(conflict_idx) = self.focus {
+                            self.cmd_close_target(true, Some(CellTarget::Idx(conflict_idx)));
+                            if let Some(ei) = editor_cell_idx {
+                                // The close shifted indices above it
+                                // down by one — re-align before focusing.
+                                let target = if ei > conflict_idx { ei - 1 } else { ei };
+                                if target < self.cells.len() {
+                                    self.set_focus(FocusId::Cell(target));
+                                }
+                            }
+                        }
                     }
                     Err(e) => self.status.push_auto(format!("write failed: {e}")),
                 }
@@ -1835,6 +1934,16 @@ impl App {
                 self.status.push_auto(format!("unsaved: {name} (use :Q!)"));
                 return;
             }
+            // Busy-PTY guard: same as `:q`, but walks every session in
+            // every cell — `:Q` tears the whole app down, so any live
+            // shell/claude anywhere is a reason to refuse.
+            if let Some(label) = self.cells.iter()
+                .flat_map(|c| c.sessions.iter())
+                .find_map(pty_busy_label_from_session)
+            {
+                self.status.push_auto(format!("{label} is busy (use :Q!)"));
+                return;
+            }
         }
         self.should_quit = true;
     }
@@ -1848,6 +1957,10 @@ impl App {
                 _ => None,
             }) {
                 self.status.push_auto(format!("unsaved: {name} (use :q! *)"));
+                return;
+            }
+            if let Some(label) = self.cells.iter().find_map(cell_active_pty_busy_label) {
+                self.status.push_auto(format!("{label} is busy (use :q! *)"));
                 return;
             }
         }
@@ -1974,6 +2087,50 @@ impl App {
         }
     }
 
+    /// `:ex <cmd>` — run a one-off command in an ephemeral, minimized
+    /// pty cell. When the command exits, `reap_exited_ptys` drops the
+    /// cell on the next tick. Not persisted to `.acedata`.
+    fn cmd_execute(&mut self, cmdline: &str) {
+        if cmdline.is_empty() {
+            self.status.push_auto("usage: :ex <cmd>".into());
+            return;
+        }
+        if self.cells.len() >= MAX_CELLS {
+            self.status.push_auto(format!("max {MAX_CELLS} cells"));
+            return;
+        }
+        // Size against the slot the cell would occupy as visible — it's
+        // immediately minimized, but the spawned PTY still parses
+        // against these dimensions if the user later restores it.
+        let new_total = self.cells.len() + 1;
+        let rect = self.prospective_cell_rect(0, new_total);
+        let (rows, cols) = crate::ui::inner_size(rect);
+        match PtySession::spawn_exec(
+            cmdline,
+            rows.max(3),
+            cols.max(20),
+            self.pty_cwd().as_deref(),
+            self.tx.clone(),
+        ) {
+            Ok(pty) => {
+                let mut cell = Cell::with_session(Session::Shell(pty));
+                cell.ephemeral = true;
+                cell.minimized = true;
+                // Minimized cells live at the tail so the
+                // visible-first invariant holds.
+                self.cells.push(cell);
+                self.status.push_auto(format!("ex: {cmdline}"));
+                // No on_sessions_changed(): ephemeral cells are
+                // excluded from the snapshot, so nothing would change
+                // on disk. But we still need to nudge the explorer so
+                // the new row shows in OPEN CELLS — normally the
+                // `.acedata` write's FS event handles that.
+                self.pending_explorer_refresh = true;
+            }
+            Err(e) => self.status.push_auto(format!("spawn failed: {e}")),
+        }
+    }
+
     fn cmd_tab(&mut self, spec: &str) {
         let cell_idx = match self.focus {
             FocusId::Cell(i) => i,
@@ -2083,6 +2240,16 @@ impl App {
             };
             self.status.push_auto(format!("unsaved: {name} (use :close!)"));
             return;
+        }
+
+        // Busy-PTY guard: refuse to close a claude/shell cell while
+        // something's actively producing output (command running,
+        // Claude mid-response). User must `:q!` to force.
+        if !force {
+            if let Some(label) = cell_active_pty_busy_label(&self.cells[cell_idx]) {
+                self.status.push_auto(format!("{label} is busy (use :q!)"));
+                return;
+            }
         }
 
         let was_focused = matches!(self.focus, FocusId::Cell(i) if i == cell_idx);
@@ -2338,6 +2505,27 @@ impl App {
         self.current_project_root().or_else(home_dir)
     }
 
+    /// Pipe the last output line of every running ephemeral (`:ex`) pty
+    /// to the status bar, one message per distinct tail. We trim and
+    /// cap to a single line so a noisy command (cargo, npm) nudges the
+    /// status without flooding it. Skips exited PTYs — `reap_exited_ptys`
+    /// handles the final message on completion.
+    pub fn poll_ephemeral_status(&mut self) {
+        let mut updates: Vec<(usize, String)> = Vec::new();
+        for (ci, cell) in self.cells.iter().enumerate() {
+            if !cell.ephemeral { continue; }
+            let Some(pty) = cell.active_session().as_pty() else { continue; };
+            if pty.has_exited() { continue; }
+            let Some(line) = pty.last_nonempty_line() else { continue; };
+            if cell.exec_last_pushed.as_deref() == Some(line.as_str()) { continue; }
+            updates.push((ci, line));
+        }
+        for (ci, line) in updates {
+            self.status.push_live("ex:", format!("ex: {}", truncate_ex_line(&line)));
+            self.cells[ci].exec_last_pushed = Some(line);
+        }
+    }
+
     /// Scan every cell for PTY sessions whose child has exited and
     /// remove those sessions. If a removal empties a cell, the cell is
     /// dropped too. Returns the number of sessions reaped.
@@ -2346,16 +2534,30 @@ impl App {
         // Collect exits as (cell_idx, session_idx) before mutating so we
         // can work back-to-front and keep indices stable.
         let mut hits: Vec<(usize, usize)> = Vec::new();
+        // Ephemeral final-output push: capture each `:ex` cell's last
+        // line before we drop its PTY, so the user sees the tail of the
+        // output even if it landed between the last poll and exit.
+        let mut ephemeral_finals: Vec<String> = Vec::new();
         for (ci, cell) in self.cells.iter().enumerate() {
             for (si, sess) in cell.sessions.iter().enumerate() {
                 if let Some(pty) = sess.as_pty() {
                     if pty.has_exited() {
                         hits.push((ci, si));
+                        if cell.ephemeral && cell.active == si {
+                            if let Some(line) = pty.last_nonempty_line() {
+                                if cell.exec_last_pushed.as_deref() != Some(line.as_str()) {
+                                    ephemeral_finals.push(line);
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
         if hits.is_empty() { return 0; }
+        for line in ephemeral_finals {
+            self.status.push_live("ex:", format!("ex: {}", truncate_ex_line(&line)));
+        }
 
         // Drop session-by-session. We process in reverse so shifting
         // indices within the same cell don't invalidate earlier hits.
@@ -2418,6 +2620,11 @@ impl App {
                 }
             }
             self.on_sessions_changed();
+            // Ephemeral cell removal doesn't change the `.acedata`
+            // snapshot, so its FS event doesn't fire and the explorer
+            // wouldn't otherwise notice. Nudge it here so the OPEN
+            // CELLS list drops the row immediately.
+            self.pending_explorer_refresh = true;
         }
         reaped
     }
@@ -2433,6 +2640,9 @@ impl App {
             _                => None,
         };
         for (self_idx, cell) in self.cells.iter().enumerate() {
+            if cell.ephemeral {
+                continue;
+            }
             let mut cs = CellState { active: cell.active, sessions: Vec::new() };
             for sess in &cell.sessions {
                 let (kind, path) = match sess {
@@ -2538,7 +2748,7 @@ impl App {
                 continue;
             }
             let active = cs.active.min(sessions.len().saturating_sub(1));
-            self.cells.push(Cell { sessions, active, minimized: false });
+            self.cells.push(Cell { sessions, active, minimized: false, ephemeral: false, exec_last_pushed: None });
             restored += 1;
         }
         restored
@@ -2813,17 +3023,30 @@ impl App {
             return;
         }
 
+        // When `projects.active == idx`, there's no real outgoing
+        // project to persist or park — either the list was empty before
+        // the incoming project was pushed (`:proj add` on a welcome
+        // session), or the user asked to switch to the already-active
+        // project. Persisting would overwrite the incoming project's
+        // `.acedata` with whatever rootless/scratch cells are currently
+        // on screen, clobbering the state we're about to restore. Any
+        // existing cells are treated as rootless `kept` so external
+        // work survives.
+        let reentering = self.projects.active == idx;
+
         // 1. Flush outgoing project's cell state to its `.acedata` so
         //    anything opened since startup (or last tick) survives the
         //    switch. We do this before flipping `active`.
-        self.persist_cells();
+        if !reentering {
+            self.persist_cells();
+        }
 
         // 2. Park outgoing cells in memory so their PTYs keep running in
         //    the background. Returning to this project later pulls them
         //    back verbatim instead of respawning from `.acedata`. Cells
         //    from a rootless (files-only) session have nowhere to park,
         //    so they carry forward as `kept` like before.
-        let outgoing_root = self.current_project_root();
+        let outgoing_root = if reentering { None } else { self.current_project_root() };
         let preserve_all = outgoing_root.is_none();
         let outgoing_focus = if let FocusId::Cell(i) = self.focus { Some(i) } else { None };
         let kept: Vec<Cell> = if preserve_all {
@@ -3729,6 +3952,24 @@ impl App {
                     Err(e) => self.status.push_auto(format!("stash drop: {e}")),
                 }
             }
+            PendingConfirm::DeletePath { path, is_dir } => {
+                let result = if is_dir {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+                let name = path.file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                match result {
+                    Ok(()) => {
+                        self.refresh_git();
+                        self.explorer.refresh(&self.projects, self.cells.len());
+                        self.status.push_auto(format!("deleted {name}"));
+                    }
+                    Err(e) => self.status.push_auto(format!("delete: {e}")),
+                }
+            }
         }
     }
 
@@ -4010,6 +4251,25 @@ fn cell_active_editor_is_dirty(cell: &Cell) -> bool {
     matches!(cell.active_session(), Session::Edit(e) if e.dirty)
 }
 
+/// If the cell's active session is a claude/shell PTY currently
+/// producing output (see `PtySession::is_busy`), returns a short label
+/// for the status-bar message (e.g. "claude", "shell"). Non-PTY or
+/// idle PTY cells return `None` — `:q` closes them normally.
+fn cell_active_pty_busy_label(cell: &Cell) -> Option<&'static str> {
+    pty_busy_label_from_session(cell.active_session())
+}
+
+/// Same busy check as `cell_active_pty_busy_label`, but takes a
+/// session directly — used by `:Q` to scan every session in every
+/// cell (not just the active one in each).
+fn pty_busy_label_from_session(s: &Session) -> Option<&'static str> {
+    match s {
+        Session::Claude(p) if p.is_busy() => Some("claude"),
+        Session::Shell(p)  if p.is_busy() => Some("shell"),
+        _ => None,
+    }
+}
+
 /// Spawn `sudo -S tee <path>` and feed it the password followed by the
 /// file content. Returns the first line of stderr on failure so the
 /// user sees "incorrect password" / "not in the sudoers file" instead
@@ -4163,6 +4423,18 @@ fn real_path_case(user_path: &Path) -> Option<PathBuf> {
     Some(actual)
 }
 
+/// Clip a single output line to a status-bar-friendly length. 120 chars
+/// is comfortable for most terminals; beyond that we add an ellipsis so
+/// the user still sees where it was cut.
+fn truncate_ex_line(s: &str) -> String {
+    const MAX: usize = 120;
+    if s.chars().count() <= MAX {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(MAX).collect();
+    format!("{head}…")
+}
+
 fn kind_label(k: SessionKind) -> &'static str {
     match k {
         SessionKind::Claude   => "claude",
@@ -4184,11 +4456,28 @@ ACE — quick reference
 GLOBAL
   :               enter command mode
   Esc             leave Insert / Visual / Command → Normal
+                  in a PTY cell already in Normal: send a literal ESC
+                  byte to the child (claude / shell escape key)
   Ctrl-c          in a PTY cell: forward SIGINT to the child
                   in an editor + Insert: drop back to Normal
                   elsewhere: no-op (use `:q` / `:Q` to quit)
   Space           enter jump mode (status bar shows [0 explorer  1-9 cell])
   Space again     leave jump mode
+
+MOUSE
+  Left click      cell     → focus
+                  explorer → focus + select / activate the row
+                             (opens files, switches projects, toggles
+                             dirs, restores minimized open cells)
+  Double click    cell     → enter Insert
+                  explorer → toggle git overview (same as `g`)
+  Middle click    cell     → close it (same dirty-editor guard as :q;
+                             forced drops still require `:q!`)
+  Right click     cell     → arm swap/move (border turns orange)
+                             then left-click a cell to swap + follow,
+                             left-click the explorer to minimize, or
+                             right-click again to cancel
+  Scroll wheel    explorer → move selection up / down
 
 JUMP MODE (after Space)
   0               toggle / focus explorer, leave jump mode
@@ -4344,6 +4633,7 @@ BORDER COLOURS (focused pane)
   Normal          cyan       default mode
   Insert          green      editor / PTY insert mode
   Visual          magenta    editor visual selection
+  Swap / move     orange     source cell while a swap/move is armed
   Git overview    green      explorer in a git sub-mode overview / log
   Git branches    purple     explorer cursor in the branches list
   Git changes     orange     explorer cursor in the changes list
@@ -4371,7 +4661,10 @@ CLI
                                      # set to false to opt out
 
 GIT — EXPLORER SUB-MODES
-  g               overview  (Esc: back to Normal)
+  g               overview (from Normal); anywhere inside git →
+                  exit straight back to Normal (one step, unlike Esc)
+  Esc             step one level up (Branches/Changes/Log → Overview
+                  → Normal)
   b               branches  (in overview: j/k nav, Enter check out, D delete)
   c               changes   (in overview: s stage, u unstage, d discard, Enter diff)
   l               git log

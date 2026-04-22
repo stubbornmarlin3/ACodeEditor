@@ -89,11 +89,19 @@ pub struct Cell {
     /// cells show at the end of the "OPEN CELLS" explorer list, and
     /// are restored via `space+N` / `:restore N` / `Alt+N` (swap).
     pub minimized: bool,
+    /// Ephemeral cells are skipped by `.acedata` persistence. Backing
+    /// for `:ex <cmd>` one-shot pty cells — they come and go with the
+    /// spawned process and shouldn't round-trip across restarts.
+    pub ephemeral: bool,
+    /// Last output line pushed to the status bar for this ephemeral
+    /// cell. Tracked here so the per-tick poll only nudges the status
+    /// when the tail actually changes. `None` on non-ephemeral cells.
+    pub exec_last_pushed: Option<String>,
 }
 
 impl Cell {
     pub fn with_session(s: Session) -> Self {
-        Self { sessions: vec![s], active: 0, minimized: false }
+        Self { sessions: vec![s], active: 0, minimized: false, ephemeral: false, exec_last_pushed: None }
     }
 
     pub fn active_session(&self) -> &Session {

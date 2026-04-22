@@ -114,6 +114,18 @@ impl FileTree {
         matches!(entry.kind, EntryKind::File).then(|| entry.path.clone())
     }
 
+    /// Path of the selected row if it's a real file or directory (not
+    /// a header, project, or open-cell row). Second tuple element is
+    /// `true` for directories.
+    pub fn selected_fs_path(&self) -> Option<(PathBuf, bool)> {
+        let entry = self.entries.get(self.selected)?;
+        match entry.kind {
+            EntryKind::File => Some((entry.path.clone(), false)),
+            EntryKind::Dir  => Some((entry.path.clone(), true)),
+            _ => None,
+        }
+    }
+
     /// Project index under the cursor, if the selected row is a
     /// project header. Used by the `c` close-project shortcut.
     pub fn selected_project(&self) -> Option<usize> {

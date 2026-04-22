@@ -3,7 +3,7 @@ use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Duration;
 
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, MouseEventKind};
 use notify::{EventKind, RecommendedWatcher, Watcher};
 
 use crate::git::GitSnapshot;
@@ -11,7 +11,10 @@ use crate::git::GitSnapshot;
 pub enum AppEvent {
     Input(Event),
     Redraw,
-    /// Fresh git snapshot loaded off the UI thread.
+    /// Fresh status snapshot for the active project's root-cwd repo,
+    /// loaded off the UI thread. Cheap (one repo per tick); the app
+    /// merges it into whichever repo is at the cwd so nested repos'
+    /// cached state isn't clobbered.
     GitRefresh(GitSnapshot),
     /// Result of a backgrounded `git <sub>` shell-out (push/pull/fetch).
     /// Ok is a one-line summary for the statusbar; Err is the same with
@@ -29,17 +32,29 @@ pub enum AppEvent {
 /// Forward crossterm events into the app channel. Thread ends when the
 /// receiver drops `tx`.
 ///
-/// Filters out events we don't consume (mouse, focus gain/lost, paste)
-/// at the source — some terminals (notably Windows Terminal) flush a
-/// burst of focus/mouse events on tab refocus, and every queued event
-/// costs a wake + redraw downstream. Only keys and resizes reach the
-/// app loop.
+/// Filters out events we don't consume (focus gain/lost, paste, and
+/// mouse-drag/move) at the source — some terminals (notably Windows
+/// Terminal) flush a burst of focus/mouse events on tab refocus, and
+/// every queued event costs a wake + redraw downstream. Keys, resizes,
+/// and the mouse events we act on (clicks + scroll) reach the app loop.
 pub fn start_input_thread(tx: Sender<AppEvent>) {
     thread::spawn(move || {
         loop {
             match event::read() {
                 Ok(ev) => {
-                    let keep = matches!(ev, Event::Key(_) | Event::Resize(_, _));
+                    let keep = match &ev {
+                        Event::Key(_) | Event::Resize(_, _) => true,
+                        Event::Mouse(m) => matches!(
+                            m.kind,
+                            MouseEventKind::Down(_)
+                                | MouseEventKind::Up(_)
+                                | MouseEventKind::ScrollUp
+                                | MouseEventKind::ScrollDown
+                                | MouseEventKind::ScrollLeft
+                                | MouseEventKind::ScrollRight,
+                        ),
+                        _ => false,
+                    };
                     if !keep {
                         continue;
                     }
@@ -62,6 +77,8 @@ pub fn start_git_refresh_thread(tx: Sender<AppEvent>, interval: Duration) {
         loop {
             thread::sleep(interval);
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            // Single-repo load — the expensive nested-repo walk happens
+            // on project switch or explicit refresh, not on every tick.
             let snap = GitSnapshot::load(&cwd);
             if tx.send(AppEvent::GitRefresh(snap)).is_err() {
                 break;

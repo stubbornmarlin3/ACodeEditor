@@ -49,6 +49,25 @@ impl StatusBar {
         self.push(text, level);
     }
 
+    /// Live-update push: if the current message shares the given
+    /// prefix, replace it in place (resetting the TTL) instead of
+    /// queueing. Keeps the displayed line current — used by `:ex`
+    /// output polling so a burst of new tail lines doesn't pile up
+    /// behind an already-expired first message.
+    pub fn push_live(&mut self, prefix: &str, text: String) {
+        let level = classify(&text);
+        let replace = self.queue.front().map_or(false, |m| m.text.starts_with(prefix));
+        if replace {
+            // Drop every queued `prefix`-tagged message so we don't
+            // tail a long line with stale earlier ones.
+            self.queue.retain(|m| !m.text.starts_with(prefix));
+            self.queue.push_front(StatusMsg { text, level });
+            self.expires_at = Some(Instant::now() + MSG_TTL);
+        } else {
+            self.push(text, level);
+        }
+    }
+
     pub fn clear(&mut self) {
         self.queue.clear();
         self.expires_at = None;

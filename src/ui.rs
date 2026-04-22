@@ -1072,6 +1072,14 @@ fn is_editor_external(sess: &Session, project_root: Option<&Path>) -> bool {
 /// already unmistakable). Normal / default → accent.
 fn cell_mode_border_style(app: &App) -> Style {
     let t = &app.theme;
+    // Swap/move arm takes precedence over the regular mode colouring —
+    // the orange source-cell border is the visual anchor telling the
+    // user which cell their next click acts on.
+    if app.pending_swap || app.pending_swap_follow {
+        return Style::default()
+            .fg(Color::Rgb(0xff, 0xa8, 0x60))
+            .add_modifier(Modifier::BOLD);
+    }
     let color = match &app.mode {
         Mode::Insert       => t.ok,
         Mode::Visual { .. }=> t.magenta,
@@ -1488,8 +1496,19 @@ fn draw_explorer_panel(frame: &mut Frame, area: Rect, app: &App) {
 /// counts line.
 fn draw_explorer_normal(frame: &mut Frame, inner: Rect, app: &App) {
     let t = &app.theme;
-    let show_footer = app.git.is_repo();
-    let footer_h: u16 = if show_footer && inner.height >= 5 { 3 } else { 0 };
+    // One 3-row block per discovered repo. Cap so we never starve the
+    // file list — at least 5 rows stay for the tree itself. When the
+    // cap bites, the last rendered block is clipped and a `+N more`
+    // hint lands on the final row.
+    let n_repos = app.git.repos.len();
+    let show_footer = n_repos > 0;
+    let desired = (n_repos as u16) * 3;
+    let room    = inner.height.saturating_sub(5);
+    let footer_h: u16 = if show_footer && inner.height >= 5 {
+        desired.min(room)
+    } else {
+        0
+    };
     let list_h = inner.height.saturating_sub(footer_h);
 
     let list_rect = Rect { x: inner.x, y: inner.y, width: inner.width, height: list_h };
@@ -1558,93 +1577,175 @@ fn draw_explorer_normal(frame: &mut Frame, inner: Rect, app: &App) {
     }
 }
 
-/// 2-line status summary at the bottom of the explorer panel (plus 1-row
-/// separator above it). Shown in Normal mode only. Keeps the user
-/// oriented without stealing list space.
+/// Stacked footer: one 3-row block per discovered repo (separator with
+/// optional repo label + branch + counts). The label rule:
+///   * 1 repo, workdir == project root → unlabeled `─ git ─`
+///   * 1 repo, nested                  → `─ git · <rel> ─`
+///   * N repos                         → every block labelled (root
+///                                       uses the project folder name,
+///                                       nested repos use their rel
+///                                       path to the project root)
 fn draw_git_footer_compact(frame: &mut Frame, area: Rect, app: &App) {
-    let t = &app.theme;
-    let g = &app.git;
+    let repos_count = app.git.repos.len();
+    let w = area.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(repos_count * 3);
+    for repo in app.git.repos.iter() {
+        let label = repo_footer_label(repo, app, repos_count);
+        lines.push(build_git_separator_line(app, repo, label.as_deref(), w));
+        lines.push(truncate_line_with_arrow(Line::from(build_git_branch_spans(app, repo)), w));
+        lines.push(truncate_line_with_arrow(Line::from(build_git_counts_spans(app, repo)), w));
+    }
+    // Caller caps `area.height` to what fits; rewrite the final visible
+    // row as a terse "+N more" hint when at least one full repo block
+    // got clipped so the user knows the list is partial.
+    let h = area.height as usize;
+    if lines.len() > h {
+        lines.truncate(h);
+        let rendered_blocks = h / 3;
+        let hidden_blocks   = repos_count.saturating_sub(rendered_blocks);
+        if hidden_blocks > 0 && !lines.is_empty() {
+            let last = lines.len() - 1;
+            lines[last] = Line::from(vec![
+                Span::styled(
+                    format!(" +{hidden_blocks} more repo{}", if hidden_blocks == 1 { "" } else { "s" }),
+                    Style::default().fg(app.theme.dim),
+                )
+            ]);
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
 
-    // Same `─ git ─────` divider the expanded git mode uses, so the
-    // separator reads as a section label instead of a nameless rule.
-    // Surface mid-op state right after the label so a merge/rebase
-    // state shows up without having to expand.
+/// Label suffix for the `─ git [· name] ─` separator. Returns `None`
+/// to mean "unlabelled" (the single-repo-at-project-root case).
+fn repo_footer_label(repo: &crate::git::GitSnapshot, app: &App, repos_count: usize) -> Option<String> {
+    let wd = repo.workdir.as_ref()?;
+    let project_root = app.git.project_root.as_ref();
+    let is_root = project_root.map(|pr| path_eq(pr, wd)).unwrap_or(false);
+
+    if repos_count == 1 {
+        if is_root { return None; }
+        if let Some(pr) = project_root {
+            if let Ok(rel) = wd.strip_prefix(pr) {
+                return Some(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+        return Some(name_of(wd));
+    }
+
+    // Multi-repo: every block is labelled. Root takes the project's
+    // folder name; nested repos show their path from the project root
+    // so sibling repos are distinguishable.
+    if is_root {
+        return project_root.map(|p| name_of(p));
+    }
+    if let Some(pr) = project_root {
+        if let Ok(rel) = wd.strip_prefix(pr) {
+            return Some(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    Some(name_of(wd))
+}
+
+fn name_of(p: &std::path::Path) -> String {
+    p.file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("repo")
+        .to_string()
+}
+
+fn path_eq(a: &std::path::Path, b: &std::path::Path) -> bool {
+    // Delegates to the authoritative comparator in git.rs so Windows
+    // separator / trailing-slash normalisation stays in one place.
+    crate::git::paths_equal(a, b)
+}
+
+fn build_git_separator_line(
+    app: &App,
+    repo: &crate::git::GitSnapshot,
+    label: Option<&str>,
+    width: usize,
+) -> Line<'static> {
+    let t = &app.theme;
+    let _ = repo;
     let (label_style, rule_style) = git_divider_styles(app);
     let mut sep_spans: Vec<Span<'static>> = vec![
         Span::styled("─ ", rule_style),
         Span::styled("git", label_style),
         Span::raw(" "),
     ];
-    if !g.op_state.is_clean() {
+    if let Some(lbl) = label {
+        sep_spans.push(Span::styled("· ", rule_style));
+        sep_spans.push(Span::styled(lbl.to_string(), label_style));
+        sep_spans.push(Span::raw(" "));
+    }
+    if !repo.op_state.is_clean() {
         sep_spans.push(Span::styled(
-            format!("[{}] ", g.op_state.label()),
+            format!("[{}] ", repo.op_state.label()),
             Style::default().fg(t.err).add_modifier(Modifier::BOLD),
         ));
     }
     let used: usize = sep_spans.iter().map(|s| s.width()).sum();
-    let trailing = (area.width as usize).saturating_sub(used);
+    let trailing = width.saturating_sub(used);
     sep_spans.push(Span::styled("─".repeat(trailing), rule_style));
-    let sep_line = Line::from(sep_spans);
+    Line::from(sep_spans)
+}
 
-    let branch_style = if !g.op_state.is_clean() || g.has_conflicts() {
+fn build_git_branch_spans(app: &App, repo: &crate::git::GitSnapshot) -> Vec<Span<'static>> {
+    let t = &app.theme;
+    let branch_style = if !repo.op_state.is_clean() || repo.has_conflicts() {
         Style::default().fg(t.err).add_modifier(Modifier::BOLD)
-    } else if !g.is_clean() {
+    } else if !repo.is_clean() {
         Style::default().fg(t.warn)
     } else {
         Style::default().fg(t.ok)
     };
-    let mut line1: Vec<Span> = vec![
+    let mut spans: Vec<Span<'static>> = vec![
         Span::raw(" "),
-        Span::styled(format!("⎇ {}", g.branch), branch_style),
+        Span::styled(format!("⎇ {}", repo.branch), branch_style),
     ];
-    // Mid-op tag lives on the `─ git ─ [merging] ─` separator above;
-    // don't also duplicate it on the branch line.
-    if g.ahead > 0 {
-        line1.push(Span::styled(format!("  ↑{}", g.ahead), Style::default().fg(t.ok)));
+    if repo.ahead > 0 {
+        spans.push(Span::styled(format!("  ↑{}", repo.ahead), Style::default().fg(t.ok)));
     }
-    if g.behind > 0 {
-        line1.push(Span::styled(format!(" ↓{}", g.behind), Style::default().fg(t.warn)));
+    if repo.behind > 0 {
+        spans.push(Span::styled(format!(" ↓{}", repo.behind), Style::default().fg(t.warn)));
     }
+    spans
+}
 
-    let mut line2: Vec<Span> = vec![Span::raw(" ")];
+fn build_git_counts_spans(app: &App, repo: &crate::git::GitSnapshot) -> Vec<Span<'static>> {
+    let t = &app.theme;
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
     let mut pushed_any = false;
-    if g.staged > 0 {
-        line2.push(Span::styled(format!("S{}", g.staged), Style::default().fg(t.ok)));
+    if repo.staged > 0 {
+        spans.push(Span::styled(format!("S{}", repo.staged), Style::default().fg(t.ok)));
         pushed_any = true;
     }
-    if g.modified > 0 {
-        if pushed_any { line2.push(Span::raw(" ")); }
-        line2.push(Span::styled(format!("M{}", g.modified), Style::default().fg(t.warn)));
+    if repo.modified > 0 {
+        if pushed_any { spans.push(Span::raw(" ")); }
+        spans.push(Span::styled(format!("M{}", repo.modified), Style::default().fg(t.warn)));
         pushed_any = true;
     }
-    if g.untracked > 0 {
-        if pushed_any { line2.push(Span::raw(" ")); }
-        line2.push(Span::styled(format!("?{}", g.untracked), Style::default().fg(t.info)));
+    if repo.untracked > 0 {
+        if pushed_any { spans.push(Span::raw(" ")); }
+        spans.push(Span::styled(format!("?{}", repo.untracked), Style::default().fg(t.info)));
         pushed_any = true;
     }
-    if g.conflicts > 0 {
-        if pushed_any { line2.push(Span::raw(" ")); }
-        line2.push(Span::styled(format!("U{}", g.conflicts), Style::default().fg(t.err).add_modifier(Modifier::BOLD)));
+    if repo.conflicts > 0 {
+        if pushed_any { spans.push(Span::raw(" ")); }
+        spans.push(Span::styled(format!("U{}", repo.conflicts), Style::default().fg(t.err).add_modifier(Modifier::BOLD)));
         pushed_any = true;
     }
     if !pushed_any {
-        line2.push(Span::styled("clean", Style::default().fg(t.dim)));
+        spans.push(Span::styled("clean", Style::default().fg(t.dim)));
     }
-    if g.stash_count > 0 {
-        // `⚑` is a lightweight marker; put the count next to it so the
-        // user can tell whether `:git stash pop` has something to pop.
-        line2.push(Span::styled(
-            format!("  ⚑{}", g.stash_count),
+    if repo.stash_count > 0 {
+        spans.push(Span::styled(
+            format!("  ⚑{}", repo.stash_count),
             Style::default().fg(t.info),
         ));
     }
-    let w = area.width as usize;
-    let p = Paragraph::new(vec![
-        sep_line,
-        truncate_line_with_arrow(Line::from(line1), w),
-        truncate_line_with_arrow(Line::from(line2), w),
-    ]);
-    frame.render_widget(p, area);
+    spans
 }
 
 /// Explorer panel while any git sub-mode is active: project headers
@@ -1658,17 +1759,30 @@ fn draw_explorer_git_mode(frame: &mut Frame, inner: Rect, app: &App) {
     }
 
     let t = &app.theme;
-    let n_projects = app.projects.projects.len() as u16;
-    if inner.height <= n_projects + 3 {
+    // In git mode the top section flips from PROJECTS to REPOSITORIES
+    // — one row per discovered repo across every project, with the
+    // active repo bolded. PgUp/PgDn cycles through the same flat list
+    // (see `App::repo_jump_global`).
+    let total_repos: usize = app.projects.projects.iter()
+        .enumerate()
+        .map(|(pi, p)| {
+            // Active project's live repo count beats the stale cache
+            // (cache updates on `refresh_states`, not every tick).
+            if pi == app.projects.active { app.git.repos.len() } else { p.repos.len() }
+        })
+        .sum();
+    let n_header = (total_repos as u16).max(1);
+    if inner.height <= n_header + 3 {
         // Not enough space for a meaningful git section — just render
-        // project headers and bail.
-        draw_project_headers(frame, inner, app, inner.height.min(n_projects));
+        // repo headers and bail.
+        draw_repo_headers(frame, inner, app, inner.height.min(n_header));
         return;
     }
 
-    // Projects area (collapsed headers only).
-    let proj_rect = Rect { x: inner.x, y: inner.y, width: inner.width, height: n_projects };
-    draw_project_headers(frame, proj_rect, app, n_projects);
+    // Repositories area (collapsed headers only).
+    let proj_rect = Rect { x: inner.x, y: inner.y, width: inner.width, height: n_header };
+    draw_repo_headers(frame, proj_rect, app, n_header);
+    let n_projects = n_header;
 
     // Remaining = git section. Layout within it:
     //   row 0           : `─ git ─────────────` divider
@@ -1804,44 +1918,98 @@ fn draw_git_divider(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Render just the project-header rows (always arrow-collapsed, even
-/// the active one) into `area`. Used at the top of the git modes.
-fn draw_project_headers(frame: &mut Frame, area: Rect, app: &App, rows: u16) {
+/// Git-mode counterpart of `draw_project_headers`: one row per repo
+/// across every project. Label format: `<project>/<rel-path>` (or
+/// just `<project>` for a root repo). The active repo (matching both
+/// `projects.active` and `app.git.active`) is bolded so the user can
+/// see which one PgUp/PgDn is steering.
+fn draw_repo_headers(frame: &mut Frame, area: Rect, app: &App, rows: u16) {
     let w = area.width as usize;
-    let lines: Vec<Line> = app.projects.projects.iter().enumerate()
-        .take(rows as usize)
-        .map(|(idx, _)| truncate_line_with_arrow(project_header_line_collapsed(idx, app), w))
-        .collect();
-    let p = Paragraph::new(lines);
-    frame.render_widget(p, area);
+    let t = &app.theme;
+    let mut lines: Vec<Line> = Vec::new();
+    for (pi, project) in app.projects.projects.iter().enumerate() {
+        let is_active_proj = pi == app.projects.active;
+        // For the active project, take live state from `app.git.repos`
+        // so tinting reflects edits made this session without waiting
+        // on `refresh_states`. For other projects, rely on the cached
+        // `project.repos` populated by the last refresh.
+        if is_active_proj {
+            for (ri, repo) in app.git.repos.iter().enumerate() {
+                if lines.len() as u16 >= rows { break; }
+                let label = repo_full_label(project, repo.workdir.as_deref(), &app.git.project_root);
+                let state = crate::projects::ProjectState::from_snapshot(repo);
+                let is_active = is_active_proj && ri == app.git.active;
+                lines.push(truncate_line_with_arrow(repo_header_line(t, state, &label, is_active), w));
+            }
+        } else {
+            for ri in 0..project.repos.len() {
+                if lines.len() as u16 >= rows { break; }
+                let ri_info = &project.repos[ri];
+                let label = repo_full_label(project, Some(&ri_info.root), &Some(project.root.clone()));
+                lines.push(truncate_line_with_arrow(repo_header_line(t, ri_info.state, &label, false), w));
+            }
+        }
+        if lines.len() as u16 >= rows { break; }
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn project_header_line_collapsed(idx: usize, app: &App) -> Line<'static> {
-    let t = &app.theme;
-    let is_active = app.projects.active == idx;
-    let state = if is_active {
-        ProjectState::from_snapshot(&app.git)
-    } else {
-        app.projects.projects.get(idx).map(|p| p.state).unwrap_or(ProjectState::None)
-    };
+/// Cross-project repo label: `<project>` for a root repo, or
+/// `<project>/<rel>` for a nested repo. Falls back to the project
+/// name alone if the workdir can't be made relative.
+fn repo_full_label(
+    project: &crate::projects::Project,
+    workdir: Option<&std::path::Path>,
+    project_root: &Option<std::path::PathBuf>,
+) -> String {
+    let Some(wd) = workdir else { return project.name.clone(); };
+    if let Some(pr) = project_root.as_ref() {
+        if path_eq(pr, wd) {
+            return project.name.clone();
+        }
+        if let Ok(rel) = wd.strip_prefix(pr) {
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if rel.is_empty() {
+                return project.name.clone();
+            }
+            return format!("{}/{}", project.name, rel);
+        }
+    }
+    project.name.clone()
+}
 
-    let arrow = "▸ ";
-    let dot   = format!("{} ", state.glyph());
-    let name  = app.projects.projects.get(idx).map(|p| p.name.clone()).unwrap_or_default();
-
-    let name_style = if is_active {
+fn repo_header_line(
+    t: &Theme,
+    state: crate::projects::ProjectState,
+    label: &str,
+    is_active: bool,
+) -> Line<'static> {
+    let arrow = if is_active { "▾ " } else { "▸ " };
+    let arrow_style = Style::default().fg(t.dim);
+    let name_style  = if is_active {
         Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(t.fg).add_modifier(Modifier::BOLD)
     };
-
+    // No-repo rows never reach here — the caller only renders actual
+    // repos — but mirror the project-header behaviour: if state is
+    // None somehow, skip the dot entirely rather than show a blank.
+    if matches!(state, crate::projects::ProjectState::None) {
+        return Line::from(vec![
+            Span::styled(arrow.to_string(), arrow_style),
+            Span::styled(label.to_string(), name_style),
+        ]);
+    }
+    let dot_style = Style::default().fg(state_color(state, t));
     Line::from(vec![
-        Span::styled(arrow.to_string(), Style::default().fg(t.dim)),
-        Span::styled(dot, Style::default().fg(state_color(state, t))),
-        Span::styled(name, name_style),
+        Span::styled(arrow.to_string(), arrow_style),
+        Span::styled(format!("{} ", state.glyph()), dot_style),
+        Span::styled(label.to_string(), name_style),
     ])
 }
 
+/// Render just the project-header rows (always arrow-collapsed, even
+/// the active one) into `area`. Used at the top of the git modes.
 /// Sub-section label inside the git section — no horizontal rule,
 /// just a soft, indented heading. Shows the label, the current total,
 /// a `▸ ` cursor when its section has the cursor, and right-edge
@@ -2272,20 +2440,27 @@ fn project_header_line(e: &Entry, idx: usize, app: &App) -> Line<'static> {
     let t = &app.theme;
     let is_active = app.projects.active == idx;
 
-    // Live state for the active project comes from app.git so it tracks
-    // edits immediately; others rely on the cached per-project snapshot.
+    // Project header dot reflects the *root* repo only — a project
+    // that contains only nested repos gets no dot on its header.
+    // Nested repos show their own dots on the folder rows below.
     let state = if is_active {
-        ProjectState::from_snapshot(&app.git)
+        match app.git.root_repo() {
+            Some(r) => ProjectState::from_snapshot(r),
+            None    => ProjectState::None,
+        }
     } else {
-        app.projects.projects.get(idx).map(|p| p.state).unwrap_or(ProjectState::None)
+        // Cached per-repo states: find the one whose root == project root.
+        app.projects.projects.get(idx).and_then(|p| {
+            p.repos.iter()
+                .find(|r| crate::git::paths_equal(&r.root, &p.root))
+                .map(|r| r.state)
+        }).unwrap_or(ProjectState::None)
     };
 
     let arrow = if is_active { "▾ " } else { "▸ " };
-    let dot   = format!("{} ", state.glyph());
     let name  = app.projects.projects.get(idx).map(|p| p.name.clone()).unwrap_or_default();
 
     let arrow_style = Style::default().fg(t.dim);
-    let dot_style   = Style::default().fg(state_color(state, t));
     let name_style  = if is_active {
         Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
     } else {
@@ -2293,9 +2468,19 @@ fn project_header_line(e: &Entry, idx: usize, app: &App) -> Line<'static> {
     };
 
     let _ = e; // depth unused for headers — they're always flush-left
+    // No-repo projects: render the name flush against the arrow with
+    // no placeholder where the dot would go. Column alignment across
+    // mixed (some-repo / no-repo) project rows is a deliberate non-goal.
+    if matches!(state, ProjectState::None) {
+        return Line::from(vec![
+            Span::styled(arrow.to_string(), arrow_style),
+            Span::styled(name,              name_style),
+        ]);
+    }
+    let dot_style = Style::default().fg(state_color(state, t));
     Line::from(vec![
         Span::styled(arrow.to_string(), arrow_style),
-        Span::styled(dot,               dot_style),
+        Span::styled(format!("{} ", state.glyph()), dot_style),
         Span::styled(name,              name_style),
     ])
 }
@@ -2305,10 +2490,39 @@ fn dir_line(e: &Entry, t: &Theme, app: &App) -> Line<'static> {
     let marker = if e.expanded { "▾ " } else { "▸ " };
     let name = e.path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
     let (fg, mods) = git_tint(app.git.dir_status(&e.path), t);
-    Line::from(Span::styled(
-        format!("{indent}{marker}{name}/"),
-        Style::default().fg(fg).add_modifier(mods),
-    ))
+    let name_style = Style::default().fg(fg).add_modifier(mods);
+    // Nested repo root? Prefix the row with a status dot (same glyph
+    // scheme as the project header). Root-level repos are already
+    // covered by the project header dot, so skip them here.
+    let nested_dot = nested_repo_dot(&e.path, app);
+    if let Some((glyph, color)) = nested_dot {
+        // Dot sits after the expand arrow: `  ▸ ● frontend/`. Keeps
+        // the arrow column aligned with non-repo sibling folders.
+        Line::from(vec![
+            Span::styled(format!("{indent}{marker}"), Style::default().fg(t.dim)),
+            Span::styled(format!("{glyph} "), Style::default().fg(color)),
+            Span::styled(format!("{name}/"), name_style),
+        ])
+    } else {
+        Line::from(Span::styled(
+            format!("{indent}{marker}{name}/"),
+            name_style,
+        ))
+    }
+}
+
+/// `Some((glyph, color))` if the folder is a nested git repo (not the
+/// project root). `None` otherwise — the caller keeps the plain row.
+fn nested_repo_dot(path: &std::path::Path, app: &App) -> Option<(char, Color)> {
+    let repo = app.git.repo_at(path)?;
+    // Skip the root repo — its dot lives on the project header.
+    if let Some(pr) = app.git.project_root.as_ref() {
+        if path_eq(pr, path) {
+            return None;
+        }
+    }
+    let state = crate::projects::ProjectState::from_snapshot(repo);
+    Some((state.glyph(), state_color(state, &app.theme)))
 }
 
 fn file_line(e: &Entry, t: &Theme, app: &App) -> Line<'static> {
@@ -2328,10 +2542,8 @@ fn git_tint(s: Option<FileStatus>, t: &Theme) -> (Color, Modifier) {
         Some(FileStatus::Modified)  => (t.warn,  Modifier::empty()),
         Some(FileStatus::Added)     => (t.ok,    Modifier::empty()),
         Some(FileStatus::Renamed)   => (t.accent, Modifier::empty()),
-        // Untracked files/dirs read as grey — they're visible but not
-        // part of the repo yet, so tint them dimmer than tracked ones.
-        Some(FileStatus::Untracked) => (t.dim,   Modifier::empty()),
-        Some(FileStatus::Ignored)   => (t.muted, Modifier::empty()),
+        Some(FileStatus::Untracked) => (t.info,  Modifier::empty()),
+        Some(FileStatus::Ignored)   => (t.dim,   Modifier::empty()),
         None                        => (t.fg,    Modifier::empty()),
     }
 }
@@ -2492,10 +2704,14 @@ fn draw_statusbar(frame: &mut Frame, area: Rect, app: &App) {
     let hint: &str = if app.pending_swap || app.pending_swap_follow {
         "   [1-9 swap with cell  0 minimize] "
     } else if app.pending_jump {
-        "   [0 explorer  1-9 cell] "
+        "   [0 explorer  1-9 cell  s swap  m move  q close] "
     } else {
         match &app.mode {
-            Mode::Insert        => "",
+            // Insert mode hint is the same across editor / PTY cells —
+            // Esc is the universal way out. Put it here rather than
+            // leaving it blank so newcomers can discover normal mode
+            // without reading :help.
+            Mode::Insert        => "   [Esc normal] ",
             Mode::Command {..}  => "",
             Mode::Password {..} => "   [Enter submit  Esc cancel] ",
             Mode::Visual {..}   => "   [d delete  y yank  c change  > indent  < dedent  Esc cancel] ",
@@ -2504,13 +2720,22 @@ fn draw_statusbar(frame: &mut Frame, area: Rect, app: &App) {
                                   => "   [i insert] ",
                 FocusId::Cell(_) if app.focused_session_is_diff()
                                   => "",
+                // PTY cells (claude / shell): Esc in Normal mode
+                // forwards a literal ESC byte to the child (see
+                // main.rs::handle_normal). Surface that so users know
+                // the key isn't a no-op here.
+                FocusId::Cell(_) if app.focused_cell()
+                    .map(|c| matches!(c.active_session(),
+                        Session::Claude(_) | Session::Shell(_)))
+                    .unwrap_or(false)
+                                  => "   [i insert  Esc send esc] ",
                 FocusId::Cell(_)  => "   [i insert] ",
                 FocusId::Explorer    => match app.explorer_mode {
-                    ExplorerMode::Normal       => "   [↵ preview  e edit  a add  c close  o open  n new  g git] ",
-                    ExplorerMode::GitOverview  => "   [b branches  c changes  l log  m commit  a stage  A unstage  p push  P pull  f fetch] ",
-                    ExplorerMode::GitBranches  => "   [n new  d del  D force-del  c changes  l log] ",
-                    ExplorerMode::GitChanges   => "   [s stage  d discard  o ours  t theirs  e edit  v diff  b branches  l log] ",
-                    ExplorerMode::GitLog       => "   [v diff  c sha  b branches] ",
+                    ExplorerMode::Normal       => "   [↵ preview  e edit  a add  c close  d del  o open  n new  g git] ",
+                    ExplorerMode::GitOverview  => "   [b branches  c changes  l log  m commit  a stage  A unstage  p push  P pull  f fetch  g/Esc back] ",
+                    ExplorerMode::GitBranches  => "   [n new  d del  D force-del  c changes  l log  g exit  Esc back] ",
+                    ExplorerMode::GitChanges   => "   [s stage  d discard  o ours  t theirs  e edit  v diff  b branches  l log  g exit  Esc back] ",
+                    ExplorerMode::GitLog       => "   [v diff  c sha  b branches  g exit  Esc back] ",
                 },
             },
         }
@@ -2582,7 +2807,7 @@ fn fill_focus_summary<'a>(left: &mut Vec<Span<'a>>, app: &'a App) {
                         use crate::editor::ExternalConflict as C;
                         match ed.external_conflict {
                             Some(C::ModifiedOnDisk) =>
-                                left.push(Span::styled(" ⚠ disk changed", Style::default().fg(t.err).bold())),
+                                left.push(Span::styled(" ⚠  disk changed", Style::default().fg(t.err).bold())),
                             Some(C::Deleted) =>
                                 left.push(Span::styled(" ✗ disk gone", Style::default().fg(t.err).bold())),
                             None => {}

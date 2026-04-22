@@ -18,12 +18,15 @@ mod ui;
 mod wrap;
 
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 use app::{App, ExplorerMode, FocusId, Mode, Startup, StartupKind};
@@ -40,12 +43,16 @@ fn main() -> Result<()> {
     // anywhere in setup is covered.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
         ratatui::restore();
         reset_terminal_title();
         default_hook(info);
     }));
 
     let mut terminal = ratatui::init();
+    // Enable mouse capture so click/scroll events reach us. Errors are
+    // swallowed — mouse is a nicety, keys still drive everything.
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
 
     let (tx, rx) = mpsc::channel::<AppEvent>();
     events::start_input_thread(tx.clone());
@@ -70,6 +77,7 @@ fn main() -> Result<()> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run(&mut terminal, &mut app, &rx)
     }));
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     reset_terminal_title();
     // Final persistence runs regardless of how `run()` returned — clean
@@ -372,46 +380,26 @@ fn run(
                 .unwrap_or(Duration::from_secs(3600))
         };
         match rx.recv_timeout(timeout) {
-            Ok(AppEvent::Input(Event::Key(k))) => handle_key(app, k),
-            Ok(AppEvent::Input(Event::Resize(w, h))) => {
-                let r = Rect { x: 0, y: 0, width: w, height: h };
-                resize_ptys_if_needed(app, r);
-            }
-            Ok(AppEvent::Input(_)) => {}
-            Ok(AppEvent::Redraw)   => {}
-            Ok(AppEvent::GitRefresh(snap)) => {
-                app.set_git_snapshot(snap);
-                // Piggyback on the git tick to refresh other projects'
-                // state dots too — cheap (at our scale) and keeps the
-                // rail honest without a second timer thread.
-                app.projects.refresh_states();
-            }
-            Ok(AppEvent::GitCmdResult(r)) => {
-                match r {
-                    Ok(msg)  => app.status.push_auto(msg),
-                    Err(msg) => app.status.push_auto(msg),
-                }
-                app.refresh_git();
-            }
-            Ok(AppEvent::ExplorerTick) => {
-                // Slow fallback — FS events handle the real-time path.
-                // State persistence is handled by the end-of-loop
-                // hash-diff check, so nothing to do here for .acedata.
-                app.pending_explorer_refresh = true;
-            }
-            Ok(AppEvent::FsChange(path)) => {
-                // Real-time: a file changed under a watched root. Reconcile
-                // the affected editors immediately (cheap and path-scoped)
-                // but coalesce the explorer re-scan: a single save can emit
-                // several FS events and a full tree walk per event adds up.
-                app.handle_fs_change(&path);
-                app.pending_explorer_refresh = true;
-            }
+            Ok(ev) => dispatch_event(app, ev),
             Err(RecvTimeoutError::Timeout) => {
                 // Wake for a status-bar tick. The tick itself runs
                 // below (shared with every other loop iteration).
             }
             Err(RecvTimeoutError::Disconnected) => break,
+        }
+        // Drain everything else already queued. A chatty PTY child (e.g.
+        // `npm run dev`, a verbose build) fires one Redraw per 4KB read,
+        // and without this loop every queued Redraw would cost its own
+        // draw cycle — starving keystrokes (Esc especially) that sit
+        // behind the flood. Draining coalesces the batch into a single
+        // end-of-iteration draw while still running every event's
+        // side-effects (key handling, resize, FS reconciliation).
+        loop {
+            match rx.try_recv() {
+                Ok(ev) => dispatch_event(app, ev),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => { app.should_quit = true; break; }
+            }
         }
         // Advance past any status messages whose 3-second window has
         // elapsed; this runs every loop iteration so expiry fires even
@@ -424,6 +412,10 @@ fn run(
         // tick so a `exit`/`Ctrl-D` in a shell (or Claude quitting on
         // its own) closes the cell promptly instead of leaving a dead
         // pane the user has to `:q`.
+        // Surface ephemeral (`:ex`) command output in the status bar —
+        // one push per distinct tail line, so long-running commands
+        // show progress without flooding the command line.
+        app.poll_ephemeral_status();
         let reaped = app.reap_exited_ptys();
         if reaped > 0 {
             app.status.push_auto(format!(
@@ -455,6 +447,52 @@ fn run(
         terminal.draw(|f| ui::draw(f, app))?;
     }
     Ok(())
+}
+
+/// Run the side-effects of a single AppEvent. Does not draw — the
+/// caller is responsible for the frame, so a batch of events drained
+/// from the channel costs exactly one draw. Keep this purely
+/// dispatch: anything you add here must be cheap to run N times per
+/// loop iteration when the channel is busy.
+fn dispatch_event(app: &mut App, ev: AppEvent) {
+    match ev {
+        AppEvent::Input(Event::Key(k)) => handle_key(app, k),
+        AppEvent::Input(Event::Resize(w, h)) => {
+            let r = Rect { x: 0, y: 0, width: w, height: h };
+            resize_ptys_if_needed(app, r);
+        }
+        AppEvent::Input(Event::Mouse(m)) => handle_mouse(app, m),
+        AppEvent::Input(_) => {}
+        AppEvent::Redraw   => {}
+        AppEvent::GitRefresh(snap) => {
+            app.set_git_snapshot(snap);
+            // Piggyback on the git tick to refresh other projects'
+            // state dots too — cheap (at our scale) and keeps the
+            // rail honest without a second timer thread.
+            app.projects.refresh_states();
+        }
+        AppEvent::GitCmdResult(r) => {
+            match r {
+                Ok(msg)  => app.status.push_auto(msg),
+                Err(msg) => app.status.push_auto(msg),
+            }
+            app.refresh_git();
+        }
+        AppEvent::ExplorerTick => {
+            // Slow fallback — FS events handle the real-time path.
+            // State persistence is handled by the end-of-loop
+            // hash-diff check, so nothing to do here for .acedata.
+            app.pending_explorer_refresh = true;
+        }
+        AppEvent::FsChange(path) => {
+            // Real-time: a file changed under a watched root. Reconcile
+            // the affected editors immediately (cheap and path-scoped)
+            // but coalesce the explorer re-scan: a single save can emit
+            // several FS events and a full tree walk per event adds up.
+            app.handle_fs_change(&path);
+            app.pending_explorer_refresh = true;
+        }
+    }
 }
 
 /// Push an OSC 2 title to the outer terminal reflecting the focused
@@ -533,6 +571,285 @@ fn sync_syntax(app: &mut App) {
             }
         }
     }
+}
+
+fn point_in(x: u16, y: u16, r: Rect) -> bool {
+    x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)
+}
+
+/// Identifies where a click landed for double-click tracking. "Same
+/// target twice in quick succession" is a double-click, regardless of
+/// the exact pixel — we treat any pair of clicks on the same cell (or
+/// the sidebar) as one gesture.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum ClickTarget {
+    Cell(usize),
+    Sidebar,
+}
+
+thread_local! {
+    static LAST_LEFT_CLICK: std::cell::Cell<Option<(Instant, ClickTarget)>>
+        = const { std::cell::Cell::new(None) };
+}
+
+const DOUBLE_CLICK_MS: u128 = 400;
+
+fn hit_test(app: &App, x: u16, y: u16) -> Option<ClickTarget> {
+    let term = current_term_rect();
+    let areas = ui::layout(term, app);
+    for (i, r) in areas.cells.iter().enumerate() {
+        if r.width == 0 || r.height == 0 {
+            continue;
+        }
+        if point_in(x, y, *r) {
+            return Some(ClickTarget::Cell(i));
+        }
+    }
+    if !app.explorer_hidden && point_in(x, y, areas.sidebar) {
+        return Some(ClickTarget::Sidebar);
+    }
+    None
+}
+
+/// Route mouse events.
+///
+/// Left click
+///   * cell       → focus it
+///   * explorer   → focus the panel; single-click on a row also
+///                  activates it (open file / switch project / toggle
+///                  dir / focus open-cell)
+///   * while a swap is armed, left click *is* the target pick:
+///       cell     → swap
+///       sidebar  → minimize the armed cell
+///   * double     → enter Insert on a cell; toggle Git overview on
+///                  the sidebar
+///
+/// Right click
+///   * cell    → arm `Move` mode (swap with follow) using that cell as
+///               the source. Re-clicks while armed cancel.
+///
+/// Scroll over the sidebar → move the explorer selection.
+fn handle_mouse(app: &mut App, m: MouseEvent) {
+    // A pending confirm is a modal state driven by y/N keys. Mouse
+    // activity shouldn't silently resolve or bypass it.
+    if app.pending_confirm.is_some() {
+        return;
+    }
+    let term = current_term_rect();
+    let areas = ui::layout(term, app);
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let target = hit_test(app, m.column, m.row);
+
+            // A pending swap/move arm (whether set by keyboard or by a
+            // prior right-click) consumes the next left-click as its
+            // target pick. Don't count it as a double-click either.
+            if app.pending_swap || app.pending_swap_follow {
+                LAST_LEFT_CLICK.with(|c| c.set(None));
+                match target {
+                    Some(ClickTarget::Cell(b)) => {
+                        let follow = app.pending_swap_follow;
+                        app.pending_swap = false;
+                        app.pending_swap_follow = false;
+                        app.swap_focused_with_digit((b as u32) + 1, follow);
+                    }
+                    Some(ClickTarget::Sidebar) => {
+                        app.pending_swap = false;
+                        app.pending_swap_follow = false;
+                        app.minimize_focused();
+                    }
+                    None => {
+                        app.pending_swap = false;
+                        app.pending_swap_follow = false;
+                    }
+                }
+                return;
+            }
+
+            let now = Instant::now();
+            let prev = LAST_LEFT_CLICK.with(|c| c.get());
+            let is_double = match (prev, target) {
+                (Some((t, prev_target)), Some(cur)) => {
+                    now.duration_since(t).as_millis() <= DOUBLE_CLICK_MS && prev_target == cur
+                }
+                _ => false,
+            };
+            // On a double-click, reset the timer so a third click
+            // doesn't count as another double.
+            LAST_LEFT_CLICK.with(|c| {
+                c.set(if is_double { None } else { target.map(|t| (now, t)) })
+            });
+
+            match target {
+                Some(ClickTarget::Cell(i)) => {
+                    app.set_focus(FocusId::Cell(i));
+                    if is_double {
+                        // Toggle Insert ↔ Normal on double-click, same
+                        // "get in / get out" feel as the sidebar's
+                        // git-mode toggle.
+                        if matches!(app.mode, Mode::Insert) {
+                            app.enter_normal();
+                        } else {
+                            app.enter_insert();
+                        }
+                    }
+                }
+                Some(ClickTarget::Sidebar) => {
+                    // Always focus the sidebar on click, even when the
+                    // click lands on a header row or on empty space
+                    // below the tree — otherwise the user has to hunt
+                    // for a selectable row to get the explorer active.
+                    app.set_focus(FocusId::Explorer);
+                    if is_double {
+                        toggle_git_mode(app);
+                    } else {
+                        handle_explorer_click(app, m.column, m.row, areas.sidebar);
+                    }
+                }
+                None => {}
+            }
+        }
+        MouseEventKind::Down(MouseButton::Middle) => {
+            // Middle-click = close the cell under the cursor. Goes
+            // through cmd_close_target with force=false so the existing
+            // dirty-editor guard still kicks in (user must :q! to drop
+            // unsaved changes — no mouse shortcut around that).
+            let target = hit_test(app, m.column, m.row);
+            if let Some(ClickTarget::Cell(i)) = target {
+                app.cmd_close_target(false, Some(crate::app::CellTarget::Idx(i)));
+            }
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            let target = hit_test(app, m.column, m.row);
+            // Any right-click while armed cancels — regardless of where
+            // it lands. Consistent "right click = cancel" once in swap.
+            if app.pending_swap || app.pending_swap_follow {
+                app.pending_swap = false;
+                app.pending_swap_follow = false;
+                return;
+            }
+            if let Some(ClickTarget::Cell(b)) = target {
+                app.set_focus(FocusId::Cell(b));
+                // `follow=true` mirrors Space+m ("move"): focus lands at
+                // the target on the second click, matching the drag-
+                // and-drop feel users expect from mouse-driven swaps.
+                app.arm_swap(true);
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            if point_in(m.column, m.row, areas.sidebar) {
+                app.explorer.move_up();
+            } else if let Some(ClickTarget::Cell(i)) = hit_test(app, m.column, m.row) {
+                scroll_cell(app, i, -1);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if point_in(m.column, m.row, areas.sidebar) {
+                app.explorer.move_down();
+            } else if let Some(ClickTarget::Cell(i)) = hit_test(app, m.column, m.row) {
+                scroll_cell(app, i, 1);
+            }
+        }
+        MouseEventKind::ScrollLeft => {
+            if let Some(ClickTarget::Cell(i)) = hit_test(app, m.column, m.row) {
+                hscroll_cell(app, i, -1);
+            }
+        }
+        MouseEventKind::ScrollRight => {
+            if let Some(ClickTarget::Cell(i)) = hit_test(app, m.column, m.row) {
+                hscroll_cell(app, i, 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Route a vertical wheel tick for cell `i`. `dir` is +1 (ScrollDown)
+/// or -1 (ScrollUp). In Normal / Visual mode a PTY cell moves its
+/// virtual cursor (the j/k selection cursor) — in Visual that extends
+/// the selection since the anchor is pinned. In Insert mode it scrolls
+/// the scrollback ring instead — same split Shift+PageUp/Down uses.
+/// Other session kinds ignore the wheel for now (editors rely on
+/// keyboard motion).
+fn scroll_cell(app: &mut App, i: usize, dir: i32) {
+    let vcursor_mode = matches!(app.mode, Mode::Normal | Mode::Visual { .. });
+    let Some(cell) = app.cells.get_mut(i) else { return; };
+    match cell.active_session_mut() {
+        cell::Session::Claude(p) | cell::Session::Shell(p) => {
+            if vcursor_mode {
+                p.vcursor_move_row(dir);
+            } else {
+                // ScrollDown (dir=+1) should scroll *toward* newer
+                // output; `scroll_by` uses positive = toward the top
+                // of the scrollback, so invert the sign.
+                p.scroll_by(-dir as isize);
+            }
+        }
+        cell::Session::Edit(_) | cell::Session::Diff(_) | cell::Session::Conflict(_) => {}
+    }
+}
+
+/// Horizontal wheel tick — Normal / Visual-mode PTY cells move the
+/// vcursor left/right like h/l (extending the selection in Visual).
+/// In Insert mode there's no sensible target (PTYs don't have a
+/// horizontal scrollback), so it's a no-op.
+fn hscroll_cell(app: &mut App, i: usize, dir: i32) {
+    if !matches!(app.mode, Mode::Normal | Mode::Visual { .. }) {
+        return;
+    }
+    let Some(cell) = app.cells.get_mut(i) else { return; };
+    if let cell::Session::Claude(p) | cell::Session::Shell(p) = cell.active_session_mut() {
+        p.vcursor_move_col(dir);
+    }
+}
+
+/// Toggle between Normal and GitOverview. Any git submode is unwound
+/// to Normal in one step (instead of walking up levels), matching the
+/// intent of a single gesture: "get in" or "get out".
+fn toggle_git_mode(app: &mut App) {
+    if matches!(app.explorer_mode, ExplorerMode::Normal) {
+        app.enter_git_overview();
+    } else {
+        while !matches!(app.explorer_mode, ExplorerMode::Normal) {
+            app.exit_git_submode();
+        }
+    }
+}
+
+/// Map a click in the sidebar to an explorer row, then activate it.
+/// Mirrors the footer-height logic in `draw_explorer_normal` so clicks
+/// on the git footer don't accidentally select the row "under" them in
+/// the tree area above.
+fn handle_explorer_click(app: &mut App, cx: u16, cy: u16, sidebar: Rect) {
+    let _ = cx;
+    if sidebar.height < 2 || sidebar.width < 2 {
+        return;
+    }
+    let inner_y0 = sidebar.y + 1;
+    let inner_y_end = sidebar.y + sidebar.height - 1; // exclusive (bottom border)
+    if cy < inner_y0 || cy >= inner_y_end {
+        return;
+    }
+    let inner_h = (inner_y_end - inner_y0) as usize;
+    let n_repos = app.git.repos.len();
+    let show_footer = n_repos > 0 && inner_h >= 5;
+    let desired = n_repos * 3;
+    let room = inner_h.saturating_sub(5);
+    let footer_h = if show_footer { desired.min(room) } else { 0 };
+    let list_h = inner_h.saturating_sub(footer_h);
+
+    let row_in_inner = (cy - inner_y0) as usize;
+    if row_in_inner >= list_h {
+        return;
+    }
+    let offset = app.explorer.view_offset.get();
+    let idx = row_in_inner + offset;
+    let Some(entry) = app.explorer.entries.get(idx) else { return; };
+    if !entry.kind.is_selectable() {
+        return;
+    }
+    app.explorer.selected = idx;
+    activate_explorer_row(app);
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
@@ -1062,10 +1379,28 @@ fn handle_explorer_key(app: &mut App, key: KeyEvent) -> bool {
     }
     // Global-to-Explorer keys — available in every sub-mode so quick
     // project-hopping works whether you're browsing files or inside a
-    // git sub-view.
+    // git sub-view. In a git sub-mode with multiple discovered repos,
+    // PgUp/PgDn cycles the active repo instead of the project so the
+    // same keys steer the REPOSITORIES list like they steer PROJECTS
+    // in Normal mode.
+    let in_git_mode = !matches!(app.explorer_mode, ExplorerMode::Normal);
     match key.code {
-        KeyCode::PageUp   => { app.project_jump(false); return true; }
-        KeyCode::PageDown => { app.project_jump(true);  return true; }
+        KeyCode::PageUp => {
+            if in_git_mode {
+                app.repo_jump_global(false);
+            } else {
+                app.project_jump(false);
+            }
+            return true;
+        }
+        KeyCode::PageDown => {
+            if in_git_mode {
+                app.repo_jump_global(true);
+            } else {
+                app.project_jump(true);
+            }
+            return true;
+        }
         _ => {}
     }
     match app.explorer_mode {
@@ -1192,6 +1527,15 @@ fn handle_explorer_normal(app: &mut App, key: KeyEvent) -> bool {
             }
             true
         }
+        // `d` — delete the file or directory under the cursor, with a
+        // `[y/N]` confirm. Irreversible (no trash), so the prompt is
+        // non-optional. No-op on non-fs rows (projects, open cells).
+        KeyCode::Char('d') => {
+            if let Some((path, is_dir)) = app.explorer.selected_fs_path() {
+                app.request_confirm(app::PendingConfirm::DeletePath { path, is_dir });
+            }
+            true
+        }
         _ => false,
     }
 }
@@ -1206,6 +1550,15 @@ fn handle_git_global(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('p') => { app.git_push();         true }
         KeyCode::Char('P') => { app.git_pull();         true }
         KeyCode::Char('f') => { app.git_fetch();        true }
+        // `g` anywhere in git mode is the "get me out" shortcut —
+        // unwinds any submode straight back to Normal instead of
+        // stepping up one level (which is what Esc does).
+        KeyCode::Char('g') => {
+            while !matches!(app.explorer_mode, ExplorerMode::Normal) {
+                app.exit_git_submode();
+            }
+            true
+        }
         _ => false,
     }
 }
@@ -1283,7 +1636,15 @@ fn activate_explorer_row(app: &mut App) {
         explorer::Action::OpenFile(p)      => preview_file(app, p),
         explorer::Action::FocusOpenCell(i) => {
             if i < app.cells.len() {
-                app.set_focus(FocusId::Cell(i));
+                // A click on a minimized OPEN CELLS row should bring
+                // it back — `cmd_restore` un-minimizes, moves the cell
+                // to the master slot, and focuses it. Already-visible
+                // cells just get focused.
+                if app.cells[i].minimized {
+                    app.cmd_restore((i as u32) + 1);
+                } else {
+                    app.set_focus(FocusId::Cell(i));
+                }
             }
         }
     }

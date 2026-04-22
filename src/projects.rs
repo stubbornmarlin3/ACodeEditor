@@ -47,6 +47,37 @@ impl ProjectState {
             ProjectState::Working
         }
     }
+
+    /// Aggregate across every repo discovered under a project root.
+    /// Any repo with conflicts wins (Error); otherwise any dirty repo
+    /// demotes to Working; all clean → Ok; empty set → None. Mirrors
+    /// the dot glyph the user sees next to the project header when
+    /// the project has nested repos.
+    pub fn from_multi(multi: &crate::git::MultiRepo) -> Self {
+        if multi.repos.is_empty() {
+            return ProjectState::None;
+        }
+        let mut worst = ProjectState::Ok;
+        for r in &multi.repos {
+            let s = ProjectState::from_snapshot(r);
+            worst = match (worst, s) {
+                (ProjectState::Error, _) | (_, ProjectState::Error)     => ProjectState::Error,
+                (ProjectState::Working, _) | (_, ProjectState::Working) => ProjectState::Working,
+                (ProjectState::Ok, _) | (_, ProjectState::Ok)           => ProjectState::Ok,
+                _                                                       => worst,
+            };
+        }
+        worst
+    }
+}
+
+/// One discovered repo under a project, cached for the cross-project
+/// REPOSITORIES list in git mode. Per-repo state is kept so each row
+/// can render its own dot without reopening the repo on every frame.
+#[derive(Clone, Debug)]
+pub struct RepoInfo {
+    pub root:  PathBuf,
+    pub state: ProjectState,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +85,9 @@ pub struct Project {
     pub name:  String,
     pub root:  PathBuf,
     pub state: ProjectState,
+    /// Every git repo discovered under `root` (root repo first if
+    /// present, then nested). Rebuilt by `refresh_states`.
+    pub repos: Vec<RepoInfo>,
 }
 
 impl Project {
@@ -65,7 +99,7 @@ impl Project {
         // points, unlike `fs::canonicalize`.
         let root = std::path::absolute(&root).unwrap_or(root);
         let name = default_name(&root);
-        Self { name, root, state: ProjectState::None }
+        Self { name, root, state: ProjectState::None, repos: Vec::new() }
     }
 }
 
@@ -151,10 +185,17 @@ impl ProjectList {
         for p in self.projects.iter_mut() {
             if !p.root.exists() {
                 p.state = ProjectState::None;
+                p.repos.clear();
                 continue;
             }
-            let snap = GitSnapshot::load(&p.root);
-            p.state = ProjectState::from_snapshot(&snap);
+            let multi = crate::git::MultiRepo::discover(&p.root);
+            p.state = ProjectState::from_multi(&multi);
+            p.repos = multi.repos.iter()
+                .filter_map(|r| {
+                    let root = r.workdir.clone()?;
+                    Some(RepoInfo { root, state: ProjectState::from_snapshot(r) })
+                })
+                .collect();
         }
     }
 
@@ -308,7 +349,7 @@ fn make_project(name: String, root: String) -> Project {
     // forward we never write one, but this keeps old files readable.
     let root_path = strip_unc_prefix(&PathBuf::from(root));
     let display = if name.is_empty() { default_name(&root_path) } else { name };
-    Project { name: display, root: root_path, state: ProjectState::None }
+    Project { name: display, root: root_path, state: ProjectState::None, repos: Vec::new() }
 }
 
 fn quote(s: &str) -> String {
