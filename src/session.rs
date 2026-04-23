@@ -8,8 +8,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
-
 use crate::events::AppEvent;
+
+/// Cached render output for a PTY cell. Keyed by every input the line
+/// buffer depends on so a stale entry is never reused. On idle frames
+/// (no new PTY output, no overlay change) the UI clones `lines` instead
+/// of re-walking `vt100::Screen`.
+#[derive(Clone)]
+pub struct PtyRenderCache {
+    pub generation: u64,
+    pub rows:       u16,
+    pub cols:       u16,
+    pub scrollback: usize,
+    pub vcursor:    Option<(u16, u16)>,
+    pub sel:        Option<(u16, u16, Option<u16>, Option<u16>)>,
+    pub lines:      Vec<ratatui::text::Line<'static>>,
+}
 
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
@@ -93,6 +107,16 @@ pub struct PtySession {
     /// wrappers like Git Bash's `bin/bash.exe` launch an inner bash
     /// that permanently sits as a descendant even when idle.
     baseline_descendants: AtomicUsize,
+    /// Monotonic counter bumped by the reader thread after every
+    /// `parser.process` call. The UI renderer uses it as a cache key:
+    /// if it hasn't changed since the last frame AND the overlay
+    /// params match, the cell's rendered line buffer is reused.
+    pub render_gen: Arc<AtomicU64>,
+    /// Last rendered line buffer, for reuse on frames where neither
+    /// the generation nor overlay params have changed. Wrapped in a
+    /// Mutex because `render_pty` only has `&PtySession` (cells are
+    /// accessed via `&Cell` during draw).
+    pub render_cache: Mutex<Option<PtyRenderCache>>,
 }
 
 /// Delay after spawn before we trust the descendant-count baseline.
@@ -241,8 +265,10 @@ impl PtySession {
         let writer_clone    = Arc::clone(&writer);
         let last_output_ms  = Arc::new(AtomicU64::new(0));
         let last_output_rd  = Arc::clone(&last_output_ms);
+        let render_gen      = Arc::new(AtomicU64::new(0));
+        let render_gen_rd   = Arc::clone(&render_gen);
         thread::spawn(move || {
-            pty_reader_loop(reader, parser_clone, tx_clone, writer_clone, last_output_rd);
+            pty_reader_loop(reader, parser_clone, tx_clone, writer_clone, last_output_rd, render_gen_rd);
         });
 
         // Waiter thread: owns the Child so it doesn't become a zombie.
@@ -254,7 +280,7 @@ impl PtySession {
         thread::spawn(move || {
             let _ = child.wait();
             exited_clone.store(true, Ordering::Relaxed);
-            let _ = tx_exit.send(AppEvent::Redraw);
+            crate::events::send_redraw_coalesced(&tx_exit);
         });
 
         Ok(Self {
@@ -277,6 +303,8 @@ impl PtySession {
             child_pid,
             spawn_ms: now_ms(),
             baseline_descendants: AtomicUsize::new(usize::MAX),
+            render_gen,
+            render_cache: Mutex::new(None),
         })
     }
 
@@ -743,6 +771,7 @@ fn pty_reader_loop(
     tx: Sender<AppEvent>,
     writer: SharedWriter,
     last_output_ms: Arc<AtomicU64>,
+    render_gen: Arc<AtomicU64>,
 ) {
     let mut buf = [0u8; 4096];
     loop {
@@ -762,15 +791,19 @@ fn pty_reader_loop(
                 if let Ok(mut p) = parser.lock() {
                     p.process(&buf[..n]);
                 }
+                // Bump the render generation so the UI thread's cache
+                // invalidates. Relaxed is fine — we only care that the
+                // UI sees *some* change, not strict ordering.
+                render_gen.fetch_add(1, Ordering::Relaxed);
                 last_output_ms.store(now_ms(), Ordering::Relaxed);
-                if tx.send(AppEvent::Redraw).is_err() {
+                if !crate::events::send_redraw_coalesced(&tx) {
                     break;
                 }
             }
             Err(_) => break,
         }
     }
-    let _ = tx.send(AppEvent::Redraw);
+    crate::events::send_redraw_coalesced(&tx);
 }
 
 /// Names of processes ConPTY (Windows) attaches to every pseudoterminal

@@ -1,12 +1,46 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Duration;
 
+/// Global "a Redraw event is already queued" flag. A chatty PTY reading
+/// 4KB at a time can fire hundreds of Redraws a second — the main loop
+/// coalesces them on the receive side, but the channel still pays
+/// allocation + cross-thread wake for each. This flag lets senders
+/// short-circuit enqueuing when one is already in flight. Main loop
+/// clears it on pop.
+pub static REDRAW_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Queue a Redraw event only if one isn't already pending. Safe to call
+/// from any thread. Uses a CAS so concurrent senders don't both slip
+/// past the check. Returns false on channel disconnect so readers can
+/// shut down.
+pub fn send_redraw_coalesced(tx: &Sender<AppEvent>) -> bool {
+    if REDRAW_PENDING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return true;
+    }
+    if tx.send(AppEvent::Redraw).is_err() {
+        REDRAW_PENDING.store(false, Ordering::Release);
+        return false;
+    }
+    true
+}
+
+/// Main-loop hook: mark the Redraw slot free so the next PTY burst can
+/// enqueue one again. Called on pop of `AppEvent::Redraw`.
+pub fn notice_redraw_drained() {
+    REDRAW_PENDING.store(false, Ordering::Release);
+}
+
 use crossterm::event::{self, Event, MouseEventKind};
 use notify::{EventKind, RecommendedWatcher, Watcher};
 
-use crate::git::GitSnapshot;
+use crate::git::{GitSnapshot, MultiRepo};
+use crate::projects::RailRefresh;
 
 pub enum AppEvent {
     Input(Event),
@@ -16,6 +50,20 @@ pub enum AppEvent {
     /// merges it into whichever repo is at the cwd so nested repos'
     /// cached state isn't clobbered.
     GitRefresh(GitSnapshot),
+    /// Startup-time handoff: the full MultiRepo (active project) plus
+    /// per-project rail states, all loaded off the UI thread so the
+    /// first frame renders instantly with empty dots and fills in when
+    /// discovery completes. Project switches can also post this to
+    /// avoid blocking the UI for long walks.
+    GitBootstrap {
+        multi: MultiRepo,
+        rail:  Vec<RailRefresh>,
+    },
+    /// Rail-only refresh: recomputes per-project state dots without
+    /// rebuilding the active `MultiRepo`. Cheaper than `GitBootstrap`
+    /// because it skips the active-repo walk the passive GitRefresh
+    /// already handles.
+    RailRefresh(Vec<RailRefresh>),
     /// Result of a backgrounded `git <sub>` shell-out (push/pull/fetch).
     /// Ok is a one-line summary for the statusbar; Err is the same with
     /// stderr's first line.
@@ -68,6 +116,37 @@ pub fn start_input_thread(tx: Sender<AppEvent>) {
     });
 }
 
+/// One-shot background bootstrap: walk the active project's tree for
+/// nested repos (the pricey part) and compute rail state dots for every
+/// open project, off the UI thread. The app starts with empty repos +
+/// `None` dots; this fills them in when discovery finishes. Cheap to
+/// call again on project switch to avoid blocking the UI.
+/// Background rail-only refresh. Complements the passive `GitRefresh`
+/// tick: the periodic thread handles the active repo, this handles the
+/// project rail dots. Separate so each can be throttled / skipped
+/// independently.
+pub fn spawn_rail_refresh(tx: Sender<AppEvent>, rail_roots: Vec<std::path::PathBuf>) {
+    if rail_roots.is_empty() {
+        return;
+    }
+    thread::spawn(move || {
+        let rail = crate::projects::ProjectList::compute_rail(&rail_roots);
+        let _ = tx.send(AppEvent::RailRefresh(rail));
+    });
+}
+
+pub fn spawn_git_bootstrap(
+    tx: Sender<AppEvent>,
+    active_root: std::path::PathBuf,
+    rail_roots: Vec<std::path::PathBuf>,
+) {
+    thread::spawn(move || {
+        let multi = MultiRepo::discover(&active_root);
+        let rail = crate::projects::ProjectList::compute_rail(&rail_roots);
+        let _ = tx.send(AppEvent::GitBootstrap { multi, rail });
+    });
+}
+
 /// Periodic background git refresh. Loads a fresh `GitSnapshot` every
 /// `interval` and ships it to the app. Runs serially (no debounce
 /// needed): if a load takes longer than the interval, the next one just
@@ -77,9 +156,12 @@ pub fn start_git_refresh_thread(tx: Sender<AppEvent>, interval: Duration) {
         loop {
             thread::sleep(interval);
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            // Single-repo load — the expensive nested-repo walk happens
-            // on project switch or explicit refresh, not on every tick.
-            let snap = GitSnapshot::load(&cwd);
+            // Single-repo passive load — skips branches + stash (the
+            // git panel only needs those on user action, which goes
+            // through the full `refresh_git`). The expensive nested-
+            // repo walk happens on project switch or explicit refresh,
+            // not on every tick.
+            let snap = GitSnapshot::load_passive(&cwd);
             if tx.send(AppEvent::GitRefresh(snap)).is_err() {
                 break;
             }

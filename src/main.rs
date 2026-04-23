@@ -364,6 +364,21 @@ fn run(
     let mut last_title = String::new();
     update_terminal_title(app, &mut last_title);
     terminal.draw(|f| ui::draw(f, app))?;
+    // Cached layout-inputs fingerprint so we skip `resize_ptys_if_needed`
+    // when nothing that affects cell geometry has changed since the
+    // previous iteration. The PTY resize itself is nearly free when all
+    // sizes match, but the preceding `ui::layout` walk + iteration over
+    // every session still cost something per tick.
+    let mut last_layout_key: (Rect, usize, cell::LayoutMode, bool) = (
+        Rect::default(), usize::MAX, app.layout_mode, app.explorer_hidden,
+    );
+    let mut last_draw = Instant::now();
+    // ~60 FPS ceiling. With several chatty PTYs firing Redraw per 4KB
+    // chunk, an unbounded draw-per-iteration loop rebuilds every cell's
+    // Line list hundreds of times a second and the cursor blink can't
+    // keep up. Holding off a redraw for the remainder of the frame
+    // lets more events coalesce into a single draw.
+    const FRAME_MIN: Duration = Duration::from_millis(16);
 
     while !app.should_quit {
         // Block only as long as the next status message needs to stay
@@ -379,6 +394,11 @@ fn run(
                 .next_tick_in(Instant::now())
                 .unwrap_or(Duration::from_secs(3600))
         };
+        // If the previous draw was skipped for the frame budget, cap
+        // the wait so the pending state ticks across by the next frame
+        // even if no new events arrive.
+        let remaining = FRAME_MIN.saturating_sub(last_draw.elapsed());
+        let timeout = if remaining.is_zero() { timeout } else { timeout.min(remaining) };
         match rx.recv_timeout(timeout) {
             Ok(ev) => dispatch_event(app, ev),
             Err(RecvTimeoutError::Timeout) => {
@@ -431,20 +451,36 @@ fn run(
         }
         // Keep all PTYs in sync with current layout — explorer panel width,
         // cell count, and active layout algorithm all affect cell geometry.
-        resize_ptys_if_needed(app, current_term_rect());
+        // Gate on the inputs that could change geometry; the common case
+        // is they haven't, and we skip the layout walk entirely.
+        let term = current_term_rect();
+        let key = (term, app.cells.len(), app.layout_mode, app.explorer_hidden);
+        if key != last_layout_key {
+            resize_ptys_if_needed(app, term);
+            last_layout_key = key;
+        }
         // Realtime state save: any structural change (cell add/remove,
         // session rotation, path swap) is hashed and persisted now.
         // Content-only edits leave the hash unchanged and skip the write.
         app.persist_cells_if_dirty();
-        // No cells left → nothing to edit/run. Quit on the next loop
-        // iteration. Doing this after the tick lets the final "closed
-        // last cell" status message get drawn before we exit.
-        if app.cells.is_empty() {
+        // No cells left → if another project is open, switch to it so
+        // the user's other work remains accessible. Only quit if this
+        // was the last project too. The status message shows one tick
+        // before either path completes.
+        if app.cells.is_empty() && !app.try_switch_project_on_empty() {
             app.should_quit = true;
         }
         sync_syntax(app);
         update_terminal_title(app, &mut last_title);
-        terminal.draw(|f| ui::draw(f, app))?;
+        // Frame budget: if the previous draw was too recent, skip this
+        // iteration's draw and let the next recv_timeout (bounded by
+        // whatever time remains in the frame) wake us to either draw
+        // or coalesce more events first.
+        let since = last_draw.elapsed();
+        if since >= FRAME_MIN || app.should_quit {
+            terminal.draw(|f| ui::draw(f, app))?;
+            last_draw = Instant::now();
+        }
     }
     Ok(())
 }
@@ -455,6 +491,18 @@ fn run(
 /// dispatch: anything you add here must be cheap to run N times per
 /// loop iteration when the channel is busy.
 fn dispatch_event(app: &mut App, ev: AppEvent) {
+    // Mark the structural-state hint for any event that could plausibly
+    // mutate `cells` / session set / editor paths. Input + FS change
+    // are the real suspects; git/status ticks leave the snapshot alone
+    // but cheap enough to include. The hint is only a fast path —
+    // `persist_cells_if_dirty` still hashes before writing, so an
+    // over-eager mark wastes one hash, not a spurious disk write.
+    match &ev {
+        AppEvent::Input(_) | AppEvent::FsChange(_) | AppEvent::ExplorerTick => {
+            app.persist_dirty_hint = true;
+        }
+        _ => {}
+    }
     match ev {
         AppEvent::Input(Event::Key(k)) => handle_key(app, k),
         AppEvent::Input(Event::Resize(w, h)) => {
@@ -463,13 +511,21 @@ fn dispatch_event(app: &mut App, ev: AppEvent) {
         }
         AppEvent::Input(Event::Mouse(m)) => handle_mouse(app, m),
         AppEvent::Input(_) => {}
-        AppEvent::Redraw   => {}
+        AppEvent::Redraw   => events::notice_redraw_drained(),
         AppEvent::GitRefresh(snap) => {
             app.set_git_snapshot(snap);
             // Piggyback on the git tick to refresh other projects'
-            // state dots too — cheap (at our scale) and keeps the
-            // rail honest without a second timer thread.
-            app.projects.refresh_states();
+            // state dots too — but off-thread, since each project
+            // walks its tree with `MultiRepo::discover`. The UI gets
+            // a `RailRefresh` event when the background work lands.
+            let rail_roots: Vec<_> = app.projects.projects.iter().map(|p| p.root.clone()).collect();
+            events::spawn_rail_refresh(app.tx.clone(), rail_roots);
+        }
+        AppEvent::GitBootstrap { multi, rail } => {
+            app.apply_git_bootstrap(multi, rail);
+        }
+        AppEvent::RailRefresh(rail) => {
+            app.projects.apply_rail_refresh(rail);
         }
         AppEvent::GitCmdResult(r) => {
             match r {

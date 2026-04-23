@@ -80,6 +80,17 @@ pub struct RepoInfo {
     pub state: ProjectState,
 }
 
+/// One project's recomputed rail entry. Built off the UI thread and
+/// applied back to `ProjectList` by the event loop. Carries the root
+/// path (not just an index) so the apply step can skip stale entries
+/// if the rail shuffled while discovery was in flight.
+#[derive(Clone, Debug)]
+pub struct RailRefresh {
+    pub root:  PathBuf,
+    pub state: ProjectState,
+    pub repos: Vec<RepoInfo>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Project {
     pub name:  String,
@@ -131,9 +142,12 @@ impl ProjectList {
             .iter()
             .position(|p| paths_equivalent(&p.root, cwd))
             .unwrap_or(0);
-        let mut list = Self { projects, active, persistent: true };
-        list.refresh_states();
-        list
+        // Defer refresh_states — it calls MultiRepo::discover for every
+        // project, which walks trees + loads git status. Done synchronously
+        // here it blocks the first frame. The bootstrap thread kicked off
+        // from App::new refreshes state in the background and posts a
+        // GitBootstrap event. First frame renders with state=None dots.
+        Self { projects, active, persistent: true }
     }
 
     /// Session-only: a single project rooted at `cwd`. Used both for
@@ -141,9 +155,7 @@ impl ProjectList {
     /// is empty.
     pub fn cwd_only(cwd: &Path) -> Self {
         let projects = vec![Project::new(cwd.to_path_buf())];
-        let mut list = Self { projects, active: 0, persistent: false };
-        list.refresh_states();
-        list
+        Self { projects, active: 0, persistent: false }
     }
 
     /// Session-only: projects from explicit `ace <dir1> <dir2> …` args.
@@ -154,9 +166,7 @@ impl ProjectList {
             .iter()
             .position(|p| paths_equivalent(&p.root, cwd))
             .unwrap_or(0);
-        let mut list = Self { projects, active, persistent: false };
-        list.refresh_states();
-        list
+        Self { projects, active, persistent: false }
     }
 
     /// Session-only: no projects at all. Used for files-only invocations
@@ -196,6 +206,42 @@ impl ProjectList {
                     Some(RepoInfo { root, state: ProjectState::from_snapshot(r) })
                 })
                 .collect();
+        }
+    }
+
+    /// Off-thread twin of `refresh_states`: computes each project's
+    /// rail entry without touching `self`. Caller applies via
+    /// `apply_rail_refresh` back on the UI thread.
+    pub fn compute_rail(roots: &[PathBuf]) -> Vec<RailRefresh> {
+        roots.iter().map(|root| {
+            if !root.exists() {
+                return RailRefresh {
+                    root: root.clone(),
+                    state: ProjectState::None,
+                    repos: Vec::new(),
+                };
+            }
+            let multi = crate::git::MultiRepo::discover(root);
+            let state = ProjectState::from_multi(&multi);
+            let repos = multi.repos.iter()
+                .filter_map(|r| {
+                    let root = r.workdir.clone()?;
+                    Some(RepoInfo { root, state: ProjectState::from_snapshot(r) })
+                })
+                .collect();
+            RailRefresh { root: root.clone(), state, repos }
+        }).collect()
+    }
+
+    /// Apply a batch of off-thread rail refreshes. Matches each refresh
+    /// to its project by root path (not index) so shuffles while the
+    /// work was in flight don't misapply.
+    pub fn apply_rail_refresh(&mut self, batch: Vec<RailRefresh>) {
+        for r in batch {
+            if let Some(p) = self.projects.iter_mut().find(|p| paths_equivalent(&p.root, &r.root)) {
+                p.state = r.state;
+                p.repos = r.repos;
+            }
         }
     }
 

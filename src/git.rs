@@ -147,7 +147,21 @@ impl GitSnapshot {
         }
     }
 
+    /// Passive tick loader: skips the branches list + stash count
+    /// (each is a separate libgit2 pass). The UI only needs them when
+    /// the git panel is visible or the user is operating on branches,
+    /// and those code paths all go through `refresh_git` which uses the
+    /// full `load`. Used by the periodic 3s refresh thread, where
+    /// keeping status + dir-tinting fresh is what matters.
+    pub fn load_passive(start: &Path) -> Self {
+        Self::load_inner(start, false)
+    }
+
     pub fn load(start: &Path) -> Self {
+        Self::load_inner(start, true)
+    }
+
+    fn load_inner(start: &Path, include_branches_and_stash: bool) -> Self {
         // `mut` because `stash_foreach` needs `&mut Repository` —
         // libgit2 treats stash iteration as a write-adjacent op even
         // though it only reads refs.
@@ -209,9 +223,17 @@ impl GitSnapshot {
             }
         }
 
-        let branches = list_branches(&repo, &branch);
+        let branches = if include_branches_and_stash {
+            list_branches(&repo, &branch)
+        } else {
+            Vec::new()
+        };
         let op_state = classify_op_state(repo.state());
-        let stash_count = count_stashes(&mut repo);
+        let stash_count = if include_branches_and_stash {
+            count_stashes(&mut repo)
+        } else {
+            0
+        };
         let dir_statuses = build_dir_statuses(&statuses);
 
         Self {
@@ -514,17 +536,11 @@ fn find_repo_roots(project_root: &Path) -> Vec<PathBuf> {
     }
     let mut stack: Vec<(PathBuf, u8)> = vec![(project_root.to_path_buf(), 0)];
     while let Some((dir, depth)) = stack.pop() {
-        if depth >= 8 { continue; }
+        if depth >= 6 { continue; }
         let Ok(rd) = std::fs::read_dir(&dir) else { continue; };
         for entry in rd.flatten() {
             let path = entry.path();
-            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
-                || path.is_dir(); // OneDrive cloud-only placeholders can
-                                  // report as files for file_type() but
-                                  // still list as directories — double
-                                  // check with the slower path probe so
-                                  // nested repos inside such folders
-                                  // aren't missed.
+            let is_dir = is_dir_with_onedrive_probe(&entry, &path);
             if !is_dir { continue; }
             let name = match path.file_name().and_then(|s| s.to_str()) {
                 Some(n) => n,
@@ -544,6 +560,45 @@ fn find_repo_roots(project_root: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// "Is this dir-like?" probe that's cheap in the common case and still
+/// correct for OneDrive cloud-only placeholders. Those placeholders are
+/// reparse points: `file_type()` reports them as non-dir, but they
+/// actually enumerate as directories via `path.is_dir()` (a stat).
+///
+/// On non-Windows and for non-reparse-point entries the fast
+/// `file_type().is_dir()` is authoritative — skip the stat. On Windows,
+/// consult metadata for the reparse-point attribute and only fall back
+/// to `path.is_dir()` when the entry is actually a reparse point. This
+/// cuts one stat per child on big OneDrive-backed trees.
+#[cfg(windows)]
+fn is_dir_with_onedrive_probe(entry: &std::fs::DirEntry, path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    if let Ok(ft) = entry.file_type() {
+        if ft.is_dir() { return true; }
+        if !ft.is_symlink() {
+            // Reparse points on Windows surface as `is_symlink() == true`
+            // at the FileType level (OneDrive placeholders, junctions,
+            // symlinks all share that flag). Non-symlink non-dir → file.
+            return false;
+        }
+    }
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let is_reparse = entry
+        .metadata()
+        .map(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+        .unwrap_or(false);
+    if is_reparse {
+        path.is_dir()
+    } else {
+        false
+    }
+}
+
+#[cfg(not(windows))]
+fn is_dir_with_onedrive_probe(entry: &std::fs::DirEntry, _path: &Path) -> bool {
+    entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
 }
 
 /// Is `path` the root of a git repo — that is, is there a `.git` here

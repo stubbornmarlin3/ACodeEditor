@@ -1327,13 +1327,45 @@ fn render_pty(cell: &Cell, t: &Theme, focused: bool, mode: &Mode) -> Vec<Line<'s
         (s.col, e.col, top_row, bot_row)
     });
 
-    match session.parser.lock() {
+    let generation = session.render_gen.load(std::sync::atomic::Ordering::Relaxed);
+    let rows = session.rows;
+    let cols = session.cols;
+    let scrollback = session.scrollback();
+
+    // Cache check: if nothing the rendered buffer depends on has
+    // changed since last frame, return a clone of the cached lines and
+    // skip the vt100 walk + span construction entirely. The clone is
+    // noticeably cheaper than the rebuild for idle cells.
+    if let Ok(guard) = session.render_cache.lock() {
+        if let Some(entry) = guard.as_ref() {
+            if entry.generation == generation
+                && entry.rows == rows
+                && entry.cols == cols
+                && entry.scrollback == scrollback
+                && entry.vcursor == v_vp
+                && entry.sel == sel_vrange
+            {
+                return entry.lines.clone();
+            }
+        }
+    }
+
+    let lines = match session.parser.lock() {
         Ok(parser) => render_screen(parser.screen(), t, v_vp, sel_vrange),
         Err(_) => vec![Line::from(Span::styled(
             " (pty lock poisoned)",
             Style::default().fg(t.err),
         ))],
+    };
+
+    if let Ok(mut guard) = session.render_cache.lock() {
+        *guard = Some(crate::session::PtyRenderCache {
+            generation, rows, cols, scrollback,
+            vcursor: v_vp, sel: sel_vrange,
+            lines: lines.clone(),
+        });
     }
+    lines
 }
 
 fn render_screen(

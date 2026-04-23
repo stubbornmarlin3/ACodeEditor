@@ -344,6 +344,12 @@ pub struct App {
     /// only writes when they diverge — keeps state save effectively
     /// realtime without re-hashing more than needed.
     pub last_saved_hash: u64,
+    /// Coarse "something happened this iteration that might have changed
+    /// the structural snapshot" flag. Set by the event dispatch path and
+    /// cleared by `persist_cells_if_dirty`. When clear, the dirty-check
+    /// skips building+hashing a snapshot — cheap iteration when the
+    /// loop only woke for a status tick.
+    pub persist_dirty_hint: bool,
 
     /// Sub-mode of the Explorer panel. Purely a UI concern — cell focus
     /// elsewhere forces us back to `Normal` on re-entry.
@@ -475,7 +481,14 @@ impl App {
             let _ = std::env::set_current_dir(&dir);
         }
         let git_cwd = std::env::current_dir().unwrap_or_else(|_| cwd.clone());
-        let git = MultiRepo::discover(&git_cwd);
+        // Git discovery (nested-repo walk + per-repo status load) is
+        // the dominant cost of cold startup. Do it off-thread — the
+        // first frame renders with empty repos + `None` rail dots, and
+        // `AppEvent::GitBootstrap` fills them in when discovery finishes.
+        let mut git = MultiRepo::empty();
+        git.project_root = Some(git_cwd.clone());
+        let rail_roots: Vec<PathBuf> = projects.projects.iter().map(|p| p.root.clone()).collect();
+        crate::events::spawn_git_bootstrap(tx.clone(), git_cwd, rail_roots);
         // Cells aren't populated yet — spawn_initial_cells runs after
         // App::new. The caller refreshes the explorer with real cell
         // counts once that's done.
@@ -518,6 +531,7 @@ impl App {
             fs_watcher:        crate::events::start_fs_watcher(tx_for_watcher),
             watched:           HashSet::new(),
             last_saved_hash:   0,
+            persist_dirty_hint: false,
             explorer_mode:     ExplorerMode::Normal,
             git_branch_sel: 0,
             git_change_sel: 0,
@@ -550,19 +564,51 @@ impl App {
         self.clamp_git_cursors();
     }
 
+    /// Install the result of a background `GitBootstrap`: swap in the
+    /// active project's freshly walked `MultiRepo` and merge per-project
+    /// rail state dots. Preserves the user's `active` repo cursor if
+    /// the new MultiRepo is for the same project root.
+    pub fn apply_git_bootstrap(
+        &mut self,
+        multi: MultiRepo,
+        rail: Vec<crate::projects::RailRefresh>,
+    ) {
+        let same_project = match (&self.git.project_root, &multi.project_root) {
+            (Some(a), Some(b)) => crate::git::paths_equal(a, b),
+            _ => false,
+        };
+        let prev_active = self.git.active;
+        self.git = multi;
+        if same_project && prev_active < self.git.repos.len() {
+            self.git.active = prev_active;
+        }
+        self.clamp_git_cursors();
+        self.projects.apply_rail_refresh(rail);
+    }
+
     /// Apply a fresh single-repo snapshot delivered by the background
     /// refresh thread. Matches the snapshot's workdir against our
     /// existing `MultiRepo.repos` and replaces that slot so nested-repo
     /// state stays stable between ticks. If no match, drops the update
     /// — that means the active project or the repo set shifted and
     /// an explicit `refresh_git` will catch up.
-    pub fn set_git_snapshot(&mut self, snap: crate::git::GitSnapshot) {
+    pub fn set_git_snapshot(&mut self, mut snap: crate::git::GitSnapshot) {
         let Some(wd) = snap.workdir.clone() else { return; };
         for r in self.git.repos.iter_mut() {
             let matches = r.workdir.as_ref()
                 .map(|existing| crate::git::paths_equal(existing, &wd))
                 .unwrap_or(false);
             if matches {
+                // Passive loads (periodic tick) skip branches + stash
+                // to keep the 3s refresh cheap — preserve whatever the
+                // previous full load cached for those fields so the
+                // git panel doesn't flicker empty between user actions.
+                if snap.branches.is_empty() && !r.branches.is_empty() {
+                    snap.branches = std::mem::take(&mut r.branches);
+                }
+                if snap.stash_count == 0 && r.stash_count != 0 {
+                    snap.stash_count = r.stash_count;
+                }
                 *r = snap;
                 self.clamp_git_cursors();
                 return;
@@ -1096,7 +1142,6 @@ impl App {
         // PTY cells: sync the virtual cursor to the child's real cursor
         // (so Normal-mode motions start where the user was typing) and
         // clear any stale Visual anchor left over from a prior session.
-        let was_insert = matches!(self.mode, Mode::Insert);
         if let Some(cell) = self.focused_cell_mut() {
             match cell.active_session_mut() {
                 Session::Conflict(cv) => {
@@ -1108,9 +1153,10 @@ impl App {
                 Session::Claude(pty) | Session::Shell(pty) => {
                     pty.clear_visual();
                     pty.pending_g = false;
-                    if was_insert {
-                        pty.sync_vcursor_to_real();
-                    }
+                    // Always pick up the child's real cursor, not just
+                    // when coming from Insert — Visual→Normal and stray
+                    // Esc paths would otherwise leave vcursor stale.
+                    pty.sync_vcursor_to_real();
                 }
                 _ => {}
             }
@@ -2271,11 +2317,16 @@ impl App {
                 other                    => other,
             };
             if self.cells.is_empty() {
-                // Last cell gone → app has nothing to render. The main
-                // loop's post-event check flips `should_quit` on the
-                // next tick, so here we just park focus somewhere safe.
+                // Last cell gone. The main loop's post-event check
+                // either switches to another open project (preferred)
+                // or flips `should_quit` on the next tick. Park focus
+                // somewhere safe either way. Defer the status message
+                // to that fallback path so it reflects what actually
+                // happened (switched vs. quitting).
                 self.set_focus(FocusId::Explorer);
-                self.status.push_auto("closed last cell — quitting".into());
+                if self.projects.projects.len() <= 1 {
+                    self.status.push_auto("closed last cell — quitting".into());
+                }
             } else if was_focused {
                 // Move focus to the nearest survivor.
                 let new_focus = cell_idx.min(self.cells.len() - 1);
@@ -2497,6 +2548,23 @@ impl App {
         self.projects.projects.get(self.projects.active).map(|p| p.root.clone())
     }
 
+    /// Called from the main loop when `cells` has gone empty. If another
+    /// project is open, switch to it (its parked cells or `.acedata`
+    /// come back up) rather than quitting. Returns `true` if a switch
+    /// happened — the caller should skip the `should_quit` flip.
+    pub fn try_switch_project_on_empty(&mut self) -> bool {
+        if self.cells.is_empty() && self.projects.projects.len() > 1 {
+            let cur = self.projects.active;
+            let next = (cur + 1) % self.projects.projects.len();
+            let next_root = self.projects.projects[next].root.clone();
+            let next_name = self.projects.projects[next].name.clone();
+            self.switch_to_project_idx(next, &next_root, false);
+            self.status.push_auto(format!("closed last cell → {next_name}"));
+            return true;
+        }
+        false
+    }
+
     /// Working directory to hand to a newly-spawned shell or claude PTY.
     /// Prefers the active project root; falls back to the user's home
     /// directory so shells never inherit whatever dir `ace` was launched
@@ -2700,6 +2768,14 @@ impl App {
         if self.current_project_root().is_none() {
             return;
         }
+        // Skip the snapshot build + hash unless the dispatch layer saw
+        // something that could plausibly have mutated structural state.
+        // Event-free ticks (status bar decay, frame-budget wakeups) are
+        // a no-op here.
+        if !self.persist_dirty_hint {
+            return;
+        }
+        self.persist_dirty_hint = false;
         let h = hash_snapshot(&self.acedata_snapshot());
         if h != self.last_saved_hash {
             self.persist_cells();
@@ -2969,6 +3045,7 @@ impl App {
         if restored == 0 && self.cells.is_empty() {
             self.cells.push(Cell::with_session(Session::Edit(Editor::welcome())));
         }
+        self.enforce_welcome_solo();
         self.refresh_watchers();
         let target = match saved_focus {
             Some(i) if i < self.cells.len() => FocusId::Cell(i),
@@ -3097,6 +3174,7 @@ impl App {
             self.cells.push(Cell::with_session(Session::Edit(Editor::welcome())));
         }
         self.cells.extend(kept);
+        self.enforce_welcome_solo();
         if !preserve_focus {
             // Honour the project's saved focus when we have it; fall
             // back to explorer (or cell 0 if explorer is hidden).
@@ -3468,6 +3546,25 @@ impl App {
     /// Adjusts `focus`, `last_cell_focus`, and `preview_cell_idx` the
     /// same way `cmd_close_target` does so an evict-then-insert flow
     /// leaves bookkeeping coherent.
+    /// Enforce the invariant that a welcome cell may only exist when
+    /// it's the *only* cell. Called from restore/switch paths that can
+    /// end up with welcome sitting next to real work (e.g. an outgoing
+    /// `kept` set including welcome, or a parked project that contained
+    /// welcome when it was parked). Cheap: noop when no welcome exists,
+    /// noop when it's solo.
+    pub fn enforce_welcome_solo(&mut self) {
+        if self.cells.len() <= 1 {
+            return;
+        }
+        let has_welcome = self.cells.iter().any(|c| {
+            c.sessions.len() == 1
+                && matches!(&c.sessions[0], Session::Edit(ed) if ed.is_welcome)
+        });
+        if has_welcome {
+            self.evict_welcome_cell();
+        }
+    }
+
     pub fn evict_welcome_cell(&mut self) -> Option<usize> {
         let idx = self.cells.iter().position(|c| {
             c.sessions.len() == 1
