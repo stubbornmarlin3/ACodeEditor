@@ -325,9 +325,9 @@ fn draw_cell(frame: &mut Frame, area: Rect, cell_idx: usize, app: &App) {
 
     match cell.active_session() {
         Session::Claude(_) | Session::Shell(_) => {
-            let lines = render_pty(cell, &app.theme, focused, &app.mode);
-            let paragraph = Paragraph::new(lines).block(block);
-            frame.render_widget(paragraph, area);
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            render_pty_into(frame.buffer_mut(), inner, cell, &app.theme, focused, &app.mode);
         }
         Session::Edit(editor) => {
             let inner = block.inner(area);
@@ -1281,15 +1281,27 @@ fn short_program_name(program: &str) -> String {
         .to_string()
 }
 
-fn render_pty(cell: &Cell, t: &Theme, focused: bool, mode: &Mode) -> Vec<Line<'static>> {
+/// Paint a PTY cell's current screen into `buf` at `area`. Blits the
+/// reader-thread-produced snapshot (cell copies — no allocation, no
+/// parser-lock contention), then applies the virtual-cursor and
+/// Visual-mode selection overlays by mutating a small number of
+/// destination cells. This replaces the old `render_pty` → `Paragraph`
+/// path: the snapshot is already a ratatui `Buffer`, so there's no
+/// `Line`/`Span` materialization at all.
+fn render_pty_into(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    cell: &Cell,
+    t: &Theme,
+    focused: bool,
+    mode: &Mode,
+) {
     let session = match cell.active_session().as_pty() {
         Some(p) => p,
-        None => return Vec::new(),
+        None => return,
     };
 
     // Refresh rows_emitted before we interpret any absolute positions.
-    // Without this, a burst of PTY output since the last frame would
-    // place the virtual cursor / selection on the wrong row.
     session.tick_rows_emitted();
 
     let show_vcursor = focused
@@ -1300,171 +1312,66 @@ fn render_pty(cell: &Cell, t: &Theme, focused: bool, mode: &Mode) -> Vec<Line<'s
     } else {
         None
     };
-    // Viewport positions for overlays — `None` if the position is
-    // currently off-screen (user scrolled past it).
-    let v_vp = if show_vcursor { session.vpos_viewport_row(vcursor).map(|r| (r, vcursor.col)) } else { None };
+    let v_vp = if show_vcursor {
+        session.vpos_viewport_row(vcursor).map(|r| (r, vcursor.col))
+    } else {
+        None
+    };
 
-    // Normalize selection so `start` is older (smaller abs), `end`
-    // newer. Mirrors `visual_selection_text` so what's rendered matches
-    // what gets copied.
     let sel_abs_range = anchor.map(|a| {
-        let (start, end) = if a.abs < vcursor.abs
+        if a.abs < vcursor.abs
             || (a.abs == vcursor.abs && a.col <= vcursor.col)
         {
             (a, vcursor)
         } else {
             (vcursor, a)
-        };
-        (start, end)
+        }
     });
-
-    // Pre-compute the selection's viewport-row bounds. Endpoints that
-    // are scrolled off-screen clamp to the visible edge so a partial
-    // span still renders coherently.
     let sel_vrange = sel_abs_range.map(|(s, e)| {
-        let top_row    = session.vpos_viewport_row(s);
-        let bot_row    = session.vpos_viewport_row(e);
-        (s.col, e.col, top_row, bot_row)
+        (s.col, e.col, session.vpos_viewport_row(s), session.vpos_viewport_row(e))
     });
 
-    let generation = session.render_gen.load(std::sync::atomic::Ordering::Relaxed);
-    let rows = session.rows;
-    let cols = session.cols;
-    let scrollback = session.scrollback();
+    let Some(snap) = session.snapshot() else { return; };
 
-    // Cache check: if nothing the rendered buffer depends on has
-    // changed since last frame, return a clone of the cached lines and
-    // skip the vt100 walk + span construction entirely. The clone is
-    // noticeably cheaper than the rebuild for idle cells.
-    if let Ok(guard) = session.render_cache.lock() {
-        if let Some(entry) = guard.as_ref() {
-            if entry.generation == generation
-                && entry.rows == rows
-                && entry.cols == cols
-                && entry.scrollback == scrollback
-                && entry.vcursor == v_vp
-                && entry.sel == sel_vrange
-            {
-                return entry.lines.clone();
+    // Blit: copy snapshot cells into `buf` at `area`. Clamp to the
+    // intersection of the snapshot grid and the target area so a
+    // mid-resize draw doesn't read past either buffer.
+    let w = area.width.min(snap.cols);
+    let h = area.height.min(snap.rows);
+    for r in 0..h {
+        for c in 0..w {
+            let src = snap.buf[(c, r)].clone();
+            buf[(area.x + c, area.y + r)] = src;
+        }
+    }
+
+    // Selection overlay. Cheap: iterate the viewport rows in the
+    // selection range and OR a bg colour onto each cell's existing
+    // style so fg/bold/etc. are preserved.
+    if let Some((sc, ec, sr, er)) = sel_vrange {
+        let top = sr.unwrap_or(0);
+        let bot = er.unwrap_or(h.saturating_sub(1));
+        let sel_bg = t.bg_sel;
+        for r in top..=bot.min(h.saturating_sub(1)) {
+            let col_lo = if r == top { sc } else { 0 };
+            let col_hi = if r == bot { ec } else { w.saturating_sub(1) };
+            for c in col_lo..=col_hi.min(w.saturating_sub(1)) {
+                let dst = &mut buf[(area.x + c, area.y + r)];
+                let s = dst.style().bg(sel_bg);
+                dst.set_style(s);
             }
         }
     }
 
-    let lines = match session.parser.lock() {
-        Ok(parser) => render_screen(parser.screen(), t, v_vp, sel_vrange),
-        Err(_) => vec![Line::from(Span::styled(
-            " (pty lock poisoned)",
-            Style::default().fg(t.err),
-        ))],
-    };
-
-    if let Ok(mut guard) = session.render_cache.lock() {
-        *guard = Some(crate::session::PtyRenderCache {
-            generation, rows, cols, scrollback,
-            vcursor: v_vp, sel: sel_vrange,
-            lines: lines.clone(),
-        });
-    }
-    lines
-}
-
-fn render_screen(
-    screen: &vt100::Screen,
-    t: &Theme,
-    vcursor_vp: Option<(u16, u16)>,
-    sel_vrange: Option<(u16, u16, Option<u16>, Option<u16>)>,
-) -> Vec<Line<'static>> {
-    let (rows, cols) = screen.size();
-    let mut lines = Vec::with_capacity(rows as usize);
-
-    // Selection endpoints in viewport-row space. `None` means the
-    // endpoint is off-screen — we clamp to 0 / rows-1 so a
-    // partially-visible span still paints.
-    let (sel_start_col, sel_end_col, sel_start_row, sel_end_row) = match sel_vrange {
-        Some((sc, ec, sr, er)) => (Some(sc), Some(ec), sr, er),
-        None => (None, None, None, None),
-    };
-    let sel_active = sel_start_col.is_some();
-    let sel_bg = t.bg_sel;
-    let cursor_bg = t.fg;
-    let cursor_fg = t.bg;
-
-    for r in 0..rows {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut buf = String::new();
-        let mut current_style: Option<Style> = None;
-
-        for c in 0..cols {
-            let cell = match screen.cell(r, c) {
-                Some(c) => c,
-                None => continue,
-            };
-            let mut style = cell_style(cell);
-            let content = cell.contents();
-            let text = if content.is_empty() { " ".to_string() } else { content };
-
-            // Selection overlay — paint inside the normalized range.
-            // Endpoints clamp to 0 / rows-1 when scrolled off-screen,
-            // so a partially-visible span still paints coherently.
-            if sel_active {
-                let top = sel_start_row.unwrap_or(0);
-                let bot = sel_end_row.unwrap_or(rows - 1);
-                if r >= top && r <= bot {
-                    let col_lo = if r == top { sel_start_col.unwrap_or(0) } else { 0 };
-                    let col_hi = if r == bot { sel_end_col.unwrap_or(cols - 1) } else { cols - 1 };
-                    if c >= col_lo && c <= col_hi {
-                        style = style.bg(sel_bg);
-                    }
-                }
-            }
-
-            // Virtual cursor — drawn last so it wins over the selection
-            // bg on its own cell.
-            if let Some((vr, vc)) = vcursor_vp {
-                if vr == r && vc == c {
-                    style = style.bg(cursor_bg).fg(cursor_fg);
-                }
-            }
-
-            match current_style {
-                Some(s) if s == style => buf.push_str(&text),
-                _ => {
-                    if let Some(s) = current_style.take() {
-                        spans.push(Span::styled(std::mem::take(&mut buf), s));
-                    }
-                    buf.push_str(&text);
-                    current_style = Some(style);
-                }
-            }
+    // Cursor overlay: one cell inverted. Drawn last so it wins over
+    // selection bg on its own cell.
+    if let Some((vr, vc)) = v_vp {
+        if vr < h && vc < w {
+            let dst = &mut buf[(area.x + vc, area.y + vr)];
+            let s = dst.style().bg(t.fg).fg(t.bg);
+            dst.set_style(s);
         }
-        if let Some(s) = current_style {
-            spans.push(Span::styled(buf, s));
-        }
-        lines.push(Line::from(spans));
     }
-    lines
-}
-
-fn cell_style(cell: &vt100::Cell) -> Style {
-    let mut style = Style::default();
-
-    match cell.fgcolor() {
-        vt100::Color::Default      => {}
-        vt100::Color::Idx(i)       => style = style.fg(Color::Indexed(i)),
-        vt100::Color::Rgb(r, g, b) => style = style.fg(Color::Rgb(r, g, b)),
-    }
-    match cell.bgcolor() {
-        vt100::Color::Default      => {}
-        vt100::Color::Idx(i)       => style = style.bg(Color::Indexed(i)),
-        vt100::Color::Rgb(r, g, b) => style = style.bg(Color::Rgb(r, g, b)),
-    }
-
-    let mut mods = Modifier::empty();
-    if cell.bold()      { mods |= Modifier::BOLD; }
-    if cell.italic()    { mods |= Modifier::ITALIC; }
-    if cell.underline() { mods |= Modifier::UNDERLINED; }
-    if cell.inverse()   { mods |= Modifier::REVERSED; }
-    style.add_modifier(mods)
 }
 
 /// Left-aligned title for the explorer sidebar: just `explorer`. The digit

@@ -12,6 +12,16 @@ use std::time::Duration;
 /// clears it on pop.
 pub static REDRAW_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// Single-flight guard for the periodic rail-state refresh. Each spawn
+/// walks `MultiRepo::discover` across every open project — on slow
+/// storage (OneDrive placeholders especially) one pass can outlast the
+/// 3s refresh interval. Without this guard, ticks fired while a pass is
+/// still running stack new threads on top, and after a long idle the
+/// pile saturates disk/CPU — exactly the "longer away, longer
+/// unresponsive" regression. The spawn helper CAS-sets this to true;
+/// the thread clears it on exit.
+static RAIL_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
+
 /// Queue a Redraw event only if one isn't already pending. Safe to call
 /// from any thread. Uses a CAS so concurrent senders don't both slip
 /// past the check. Returns false on channel disconnect so readers can
@@ -129,9 +139,16 @@ pub fn spawn_rail_refresh(tx: Sender<AppEvent>, rail_roots: Vec<std::path::PathB
     if rail_roots.is_empty() {
         return;
     }
+    if RAIL_REFRESH_PENDING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
     thread::spawn(move || {
         let rail = crate::projects::ProjectList::compute_rail(&rail_roots);
         let _ = tx.send(AppEvent::RailRefresh(rail));
+        RAIL_REFRESH_PENDING.store(false, Ordering::Release);
     });
 }
 

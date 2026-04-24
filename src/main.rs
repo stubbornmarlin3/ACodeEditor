@@ -372,14 +372,6 @@ fn run(
     let mut last_layout_key: (Rect, usize, cell::LayoutMode, bool) = (
         Rect::default(), usize::MAX, app.layout_mode, app.explorer_hidden,
     );
-    let mut last_draw = Instant::now();
-    // ~60 FPS ceiling. With several chatty PTYs firing Redraw per 4KB
-    // chunk, an unbounded draw-per-iteration loop rebuilds every cell's
-    // Line list hundreds of times a second and the cursor blink can't
-    // keep up. Holding off a redraw for the remainder of the frame
-    // lets more events coalesce into a single draw.
-    const FRAME_MIN: Duration = Duration::from_millis(16);
-
     while !app.should_quit {
         // Block only as long as the next status message needs to stay
         // visible. While a confirm prompt is armed the message IS the
@@ -394,11 +386,6 @@ fn run(
                 .next_tick_in(Instant::now())
                 .unwrap_or(Duration::from_secs(3600))
         };
-        // If the previous draw was skipped for the frame budget, cap
-        // the wait so the pending state ticks across by the next frame
-        // even if no new events arrive.
-        let remaining = FRAME_MIN.saturating_sub(last_draw.elapsed());
-        let timeout = if remaining.is_zero() { timeout } else { timeout.min(remaining) };
         match rx.recv_timeout(timeout) {
             Ok(ev) => dispatch_event(app, ev),
             Err(RecvTimeoutError::Timeout) => {
@@ -472,15 +459,7 @@ fn run(
         }
         sync_syntax(app);
         update_terminal_title(app, &mut last_title);
-        // Frame budget: if the previous draw was too recent, skip this
-        // iteration's draw and let the next recv_timeout (bounded by
-        // whatever time remains in the frame) wake us to either draw
-        // or coalesce more events first.
-        let since = last_draw.elapsed();
-        if since >= FRAME_MIN || app.should_quit {
-            terminal.draw(|f| ui::draw(f, app))?;
-            last_draw = Instant::now();
-        }
+        terminal.draw(|f| ui::draw(f, app))?;
     }
     Ok(())
 }

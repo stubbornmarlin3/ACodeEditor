@@ -1,28 +1,38 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
 use crate::events::AppEvent;
 
-/// Cached render output for a PTY cell. Keyed by every input the line
-/// buffer depends on so a stale entry is never reused. On idle frames
-/// (no new PTY output, no overlay change) the UI clones `lines` instead
-/// of re-walking `vt100::Screen`.
-#[derive(Clone)]
-pub struct PtyRenderCache {
-    pub generation: u64,
+/// Pre-rendered PTY screen: a ratatui `Buffer` with styles already
+/// translated from vt100. Built on the reader thread right after
+/// `parser.process(buf)` while it still holds the parser lock, stored
+/// in `PtySession.snapshot`, and blitted into the frame buffer by the
+/// UI. Decouples the render walk from the UI thread — which means the
+/// UI never contends with the reader for the parser lock, and a full
+/// redraw costs one `Buffer` memcpy per cell instead of thousands of
+/// `String`/`Span` allocations.
+///
+/// Overlays (virtual cursor, Visual-mode selection) are NOT baked in
+/// — the UI applies them after blitting by mutating a small number of
+/// cells in the destination buffer, since they depend on focus/mode
+/// state the reader doesn't know about.
+pub struct PtySnapshot {
     pub rows:       u16,
     pub cols:       u16,
     pub scrollback: usize,
-    pub vcursor:    Option<(u16, u16)>,
-    pub sel:        Option<(u16, u16, Option<u16>, Option<u16>)>,
-    pub lines:      Vec<ratatui::text::Line<'static>>,
+    /// Cell grid sized `cols × rows`, area = `Rect::new(0, 0, cols, rows)`.
+    pub buf:        Buffer,
 }
 
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
@@ -107,16 +117,13 @@ pub struct PtySession {
     /// wrappers like Git Bash's `bin/bash.exe` launch an inner bash
     /// that permanently sits as a descendant even when idle.
     baseline_descendants: AtomicUsize,
-    /// Monotonic counter bumped by the reader thread after every
-    /// `parser.process` call. The UI renderer uses it as a cache key:
-    /// if it hasn't changed since the last frame AND the overlay
-    /// params match, the cell's rendered line buffer is reused.
-    pub render_gen: Arc<AtomicU64>,
-    /// Last rendered line buffer, for reuse on frames where neither
-    /// the generation nor overlay params have changed. Wrapped in a
-    /// Mutex because `render_pty` only has `&PtySession` (cells are
-    /// accessed via `&Cell` during draw).
-    pub render_cache: Mutex<Option<PtyRenderCache>>,
+    /// Pre-rendered `Buffer` snapshot of the current screen. Built by
+    /// the reader thread right after each `parser.process`, and also
+    /// rebuilt synchronously on scroll / resize (operations that
+    /// change what the UI should draw but don't fire a reader event).
+    /// `None` only before the very first render. UI thread reads via
+    /// `Arc::clone` — a pointer bump, no per-cell work.
+    pub snapshot: Arc<Mutex<Option<Arc<PtySnapshot>>>>,
 }
 
 /// Delay after spawn before we trust the descendant-count baseline.
@@ -265,10 +272,10 @@ impl PtySession {
         let writer_clone    = Arc::clone(&writer);
         let last_output_ms  = Arc::new(AtomicU64::new(0));
         let last_output_rd  = Arc::clone(&last_output_ms);
-        let render_gen      = Arc::new(AtomicU64::new(0));
-        let render_gen_rd   = Arc::clone(&render_gen);
+        let snapshot        = Arc::new(Mutex::new(None::<Arc<PtySnapshot>>));
+        let snapshot_rd     = Arc::clone(&snapshot);
         thread::spawn(move || {
-            pty_reader_loop(reader, parser_clone, tx_clone, writer_clone, last_output_rd, render_gen_rd);
+            pty_reader_loop(reader, parser_clone, tx_clone, writer_clone, last_output_rd, snapshot_rd);
         });
 
         // Waiter thread: owns the Child so it doesn't become a zombie.
@@ -283,7 +290,7 @@ impl PtySession {
             crate::events::send_redraw_coalesced(&tx_exit);
         });
 
-        Ok(Self {
+        let sess = Self {
             parser,
             program,
             writer,
@@ -303,9 +310,35 @@ impl PtySession {
             child_pid,
             spawn_ms: now_ms(),
             baseline_descendants: AtomicUsize::new(usize::MAX),
-            render_gen,
-            render_cache: Mutex::new(None),
-        })
+            snapshot,
+        };
+        // Seed the snapshot so the first frame has something to blit
+        // even if no PTY output has arrived yet. Cheap — an empty vt100
+        // Screen is all blanks and the build just walks the grid once.
+        sess.rebuild_snapshot_locked();
+        Ok(sess)
+    }
+
+    /// Rebuild the rendered `PtySnapshot` from the current parser state
+    /// and publish it. Call on any state change that the reader thread
+    /// won't fire on its own — scroll offset changes, resize, and the
+    /// initial seed in `spawn()`. Holds the parser lock for the
+    /// duration of the walk, same as the reader's post-`process` path,
+    /// so the two are mutually exclusive by construction.
+    pub fn rebuild_snapshot_locked(&self) {
+        let Ok(p) = self.parser.lock() else { return; };
+        let snap = build_snapshot(p.screen());
+        drop(p);
+        if let Ok(mut guard) = self.snapshot.lock() {
+            *guard = Some(Arc::new(snap));
+        }
+    }
+
+    /// Read the current snapshot (pointer-bump clone). `None` only
+    /// before the first `rebuild_snapshot_locked` — should never happen
+    /// in practice because `spawn()` seeds it.
+    pub fn snapshot(&self) -> Option<Arc<PtySnapshot>> {
+        self.snapshot.lock().ok().and_then(|g| g.clone())
     }
 
     pub fn write(&self, bytes: &[u8]) -> std::io::Result<()> {
@@ -323,16 +356,29 @@ impl PtySession {
 
     /// Current scrollback offset in lines (0 = live, N = viewing N lines
     /// back). Used by the UI to render an indicator in the cell title.
+    /// Reads from the published snapshot, not the parser — same source
+    /// of truth the UI is about to blit, and no lock contention with
+    /// the reader thread. Falls back to the atomic mirror kept in sync
+    /// by every `set_scrollback` path (including `tick_rows_emitted`)
+    /// for the pre-first-snapshot window.
     pub fn scrollback(&self) -> usize {
-        self.parser.lock().map(|p| p.screen().scrollback()).unwrap_or(0)
+        if let Some(s) = self.snapshot() {
+            return s.scrollback;
+        }
+        self.last_scrollback_offset.load(Ordering::Relaxed)
     }
 
     pub fn scroll_by(&self, delta: isize) {
-        if let Ok(mut p) = self.parser.lock() {
+        let changed = if let Ok(mut p) = self.parser.lock() {
             let cur = p.screen().scrollback() as isize;
             let next = (cur + delta).max(0) as usize;
-            p.set_scrollback(next);
-        }
+            if next != cur as usize {
+                p.set_scrollback(next);
+                self.last_scrollback_offset.store(next, Ordering::Relaxed);
+                true
+            } else { false }
+        } else { false };
+        if changed { self.rebuild_snapshot_locked(); }
     }
 
     /// Terminal title set by the child process via OSC 0/2. Empty when
@@ -369,11 +415,14 @@ impl PtySession {
     }
 
     pub fn scroll_reset(&self) {
-        if let Ok(mut p) = self.parser.lock() {
+        let changed = if let Ok(mut p) = self.parser.lock() {
             if p.screen().scrollback() != 0 {
                 p.set_scrollback(0);
-            }
-        }
+                self.last_scrollback_offset.store(0, Ordering::Relaxed);
+                true
+            } else { false }
+        } else { false };
+        if changed { self.rebuild_snapshot_locked(); }
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
@@ -396,6 +445,9 @@ impl PtySession {
         if let Some(a) = self.visual_anchor.as_mut() {
             a.col = a.col.min(cols.saturating_sub(1));
         }
+        // Snapshot is sized to the old rows/cols — rebuild at the new
+        // geometry before the next draw tries to blit a mis-sized grid.
+        self.rebuild_snapshot_locked();
         Ok(())
     }
 
@@ -538,12 +590,14 @@ impl PtySession {
         // So only the "above viewport" case can happen here, or the
         // "in viewport" case (no-op).
         let top = n.saturating_sub(s);
+        let mut changed = false;
         if abs < top {
             // Need to scroll UP (increase offset) so viewport top
             // equals abs. new_s = n - abs.
             let new_s = n.saturating_sub(abs) as usize;
             if let Ok(mut p) = self.parser.lock() {
                 p.set_scrollback(new_s);
+                changed = true;
             }
         } else if abs >= top + rows {
             // Below viewport (shouldn't happen after the clamp in
@@ -553,21 +607,27 @@ impl PtySession {
             let new_s = (n + rows - 1).saturating_sub(abs) as usize;
             if let Ok(mut p) = self.parser.lock() {
                 p.set_scrollback(new_s);
+                changed = true;
             }
         }
         // Update last_scrollback_offset so the next tick doesn't
         // misinterpret our manual scroll as an auto-shift.
-        let actual = self.scrollback();
+        let actual = self.parser.lock().map(|p| p.screen().scrollback()).unwrap_or(0);
         self.last_scrollback_offset.store(actual, Ordering::Relaxed);
+        if changed { self.rebuild_snapshot_locked(); }
     }
 
     pub fn vcursor_jump_bottom(&mut self) {
         self.tick_rows_emitted();
         self.vcursor.abs = self.live_bottom_abs();
-        if let Ok(mut p) = self.parser.lock() {
-            p.set_scrollback(0);
-        }
+        let changed = if let Ok(mut p) = self.parser.lock() {
+            if p.screen().scrollback() != 0 {
+                p.set_scrollback(0);
+                true
+            } else { false }
+        } else { false };
         self.last_scrollback_offset.store(0, Ordering::Relaxed);
+        if changed { self.rebuild_snapshot_locked(); }
     }
 
     /// Snap the virtual cursor to the PTY child's real cursor — used on
@@ -771,9 +831,22 @@ fn pty_reader_loop(
     tx: Sender<AppEvent>,
     writer: SharedWriter,
     last_output_ms: Arc<AtomicU64>,
-    render_gen: Arc<AtomicU64>,
+    snapshot: Arc<Mutex<Option<Arc<PtySnapshot>>>>,
 ) {
     let mut buf = [0u8; 4096];
+    // Throttle the redraw-wake rate under bulk streams. Small reads
+    // (typical for keystroke echo) always wake immediately so the user
+    // sees their keystroke; large-buffer bulk reads (a build log, a
+    // large paste) batch to ~8 ms. The snapshot itself is still
+    // rebuilt every read — this only caps how often we *ask* the UI
+    // thread to redraw. Pairs with `send_redraw_coalesced`'s in-flight
+    // dedup for a layered rate limit: coalescing stops pointless
+    // enqueues, throttling stops pointless wake-ups.
+    let mut last_wake = Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    const BULK_THROTTLE: std::time::Duration = std::time::Duration::from_millis(8);
+    const SMALL_READ_BYPASS: usize = 256;
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
@@ -788,22 +861,127 @@ fn pty_reader_loop(
                     }
                 }
 
+                // Hold the parser lock for both the process and the
+                // snapshot walk: this is the one place where we
+                // guarantee the snapshot matches a consistent parser
+                // state, and it keeps the lock window short (one
+                // process + one grid walk) vs. acquiring twice.
                 if let Ok(mut p) = parser.lock() {
                     p.process(&buf[..n]);
+                    let snap = build_snapshot(p.screen());
+                    drop(p);
+                    if let Ok(mut guard) = snapshot.lock() {
+                        *guard = Some(Arc::new(snap));
+                    }
                 }
-                // Bump the render generation so the UI thread's cache
-                // invalidates. Relaxed is fine — we only care that the
-                // UI sees *some* change, not strict ordering.
-                render_gen.fetch_add(1, Ordering::Relaxed);
                 last_output_ms.store(now_ms(), Ordering::Relaxed);
-                if !crate::events::send_redraw_coalesced(&tx) {
-                    break;
+
+                // Wake the UI. Small reads bypass the throttle so
+                // keystroke echo feels instant; bulk reads wait out
+                // the 8 ms window.
+                let now = Instant::now();
+                let bypass = n < SMALL_READ_BYPASS;
+                if bypass || now.duration_since(last_wake) >= BULK_THROTTLE {
+                    last_wake = now;
+                    if !crate::events::send_redraw_coalesced(&tx) {
+                        break;
+                    }
                 }
+                // When throttled, the coalesced redraw that's already
+                // in flight (or the next small read) will pick up the
+                // newest snapshot — no correctness cost.
             }
             Err(_) => break,
         }
     }
     crate::events::send_redraw_coalesced(&tx);
+}
+
+/// Walk a `vt100::Screen` into a ratatui `Buffer`. Runs on the reader
+/// thread under the parser lock. All per-cell style allocation happens
+/// here, off the UI thread; the UI side just blits and applies
+/// overlays. Interns styles by packed (fg, bg, attrs) so a screen with
+/// repeated colour runs (nearly all of them) avoids rebuilding the same
+/// `Style` thousands of times.
+fn build_snapshot(screen: &vt100::Screen) -> PtySnapshot {
+    let (rows, cols) = screen.size();
+    let scrollback = screen.scrollback();
+    let area = Rect::new(0, 0, cols, rows);
+    let mut buf = Buffer::empty(area);
+
+    // Small style-intern cache. A typical terminal screen uses <10
+    // distinct (fg,bg,attrs) combos, so a HashMap is overkill but
+    // trivially cheap and keeps the hot loop free of `Style` construction.
+    let mut style_cache: HashMap<u64, Style> = HashMap::with_capacity(16);
+
+    for r in 0..rows {
+        for c in 0..cols {
+            let Some(src) = screen.cell(r, c) else { continue; };
+            // `Buffer` indexing is (x, y); vt100 is (row, col).
+            let dst = &mut buf[(c, r)];
+            let key = cell_style_key(src);
+            let style = *style_cache
+                .entry(key)
+                .or_insert_with(|| cell_style_from_vt100(src));
+            dst.set_style(style);
+            // Skip the String allocation for empty cells — most cells
+            // on a typical screen are blank. `Buffer::empty` already
+            // filled the symbol with " ".
+            if src.has_contents() {
+                let s = src.contents();
+                if !s.is_empty() {
+                    dst.set_symbol(&s);
+                }
+            }
+        }
+    }
+
+    PtySnapshot { rows, cols, scrollback, buf }
+}
+
+/// Pack a `vt100::Cell`'s style into a `u64` key for interning. Layout:
+/// 3 bytes fg + 3 bytes bg + 1 byte attrs + 1 byte tag distinguishing
+/// "default / indexed / rgb" for each color. Uniqueness per visual
+/// style is all that matters.
+fn cell_style_key(cell: &vt100::Cell) -> u64 {
+    fn color_bits(c: vt100::Color) -> (u32, u8) {
+        match c {
+            vt100::Color::Default      => (0, 0),
+            vt100::Color::Idx(i)       => (i as u32, 1),
+            vt100::Color::Rgb(r, g, b) => ((r as u32) << 16 | (g as u32) << 8 | b as u32, 2),
+        }
+    }
+    let (fg, fg_tag) = color_bits(cell.fgcolor());
+    let (bg, bg_tag) = color_bits(cell.bgcolor());
+    let attrs = (cell.bold()      as u8)
+              | ((cell.italic()    as u8) << 1)
+              | ((cell.underline() as u8) << 2)
+              | ((cell.inverse()   as u8) << 3);
+    (fg as u64)
+        | ((bg as u64) << 24)
+        | ((attrs as u64) << 48)
+        | ((fg_tag as u64) << 56)
+        | ((bg_tag as u64) << 60)
+}
+
+fn cell_style_from_vt100(cell: &vt100::Cell) -> Style {
+    let mut style = Style::default();
+    match cell.fgcolor() {
+        vt100::Color::Default      => {}
+        vt100::Color::Idx(i)       => style = style.fg(Color::Indexed(i)),
+        vt100::Color::Rgb(r, g, b) => style = style.fg(Color::Rgb(r, g, b)),
+    }
+    match cell.bgcolor() {
+        vt100::Color::Default      => {}
+        vt100::Color::Idx(i)       => style = style.bg(Color::Indexed(i)),
+        vt100::Color::Rgb(r, g, b) => style = style.bg(Color::Rgb(r, g, b)),
+    }
+    let mut mods = Modifier::empty();
+    if cell.bold()      { mods |= Modifier::BOLD; }
+    if cell.italic()    { mods |= Modifier::ITALIC; }
+    if cell.underline() { mods |= Modifier::UNDERLINED; }
+    if cell.inverse()   { mods |= Modifier::REVERSED; }
+    style.add_modifier(mods)
 }
 
 /// Names of processes ConPTY (Windows) attaches to every pseudoterminal
