@@ -87,117 +87,19 @@ fn compute_explorer_width(area: Rect, app: &App) -> u16 {
     if app.explorer_hidden {
         return 0;
     }
-    // Hard floor (very narrow terminals) vs. comfortable default.
-    // Both the tree and the git panel share this column, so the default
-    // has to be wide enough to read `UNSTAGED (n)` / git footer rows
-    // without clipping.
+    // Fullscreen: take the whole body. Cells column falls out to 0,
+    // and the cell-draw pass skips zero-size rects.
+    if app.explorer_fullscreen {
+        return area.width;
+    }
+    // Fixed width: wide enough for `UNSTAGED (n)` / git footer and a
+    // reasonable filename, narrow enough not to steal cell real
+    // estate. Long filenames clip — consistent behavior whether
+    // focused or not beats a sidebar that jumps on focus change.
     const HARD_MIN: u16 = 18;
     const DEFAULT:  u16 = 32;
-
-    let focused = matches!(app.focus, FocusId::Explorer);
-
-    // Unfocused: park at DEFAULT so the cell area stays maximal —
-    // long filenames clip, which is fine when the user's attention is
-    // on the editor. Focused: grow to fit the longest visible row,
-    // reserving 40 cols for the cell area so we never starve it.
-    let max = if focused {
-        area.width.saturating_sub(40).max(HARD_MIN)
-    } else {
-        (area.width / 3).clamp(HARD_MIN, 60)
-    };
-    let base = DEFAULT.min(max);
-
-    if !focused {
-        return base;
-    }
-
-    // File-tree rows — always relevant in Normal mode; in git modes the
-    // project headers still sit above the git panel, so their widths
-    // count too.
-    let tree_max = app.explorer.entries.iter().map(|e| {
-        let depth_off = match e.kind {
-            EntryKind::Project { .. } | EntryKind::SectionHeader(_) => 0,
-            _                                                       => (e.depth as usize) * 2,
-        };
-        let name_len = match e.kind {
-            EntryKind::SectionHeader(label) => label.chars().count(),
-            EntryKind::OpenCell { idx } => {
-                use crate::cell::Session;
-                let (title_len, badge_len, external) = match app.cells.get(idx).map(|c| c.active_session()) {
-                    Some(Session::Edit(ed)) => {
-                        if ed.read_only {
-                            // Read-only buffers (help, …) render with
-                            // an `[ACodeEditor]` badge and never flag
-                            // external — size both in.
-                            let name_len = ed.path.as_ref()
-                                .and_then(|p| p.file_name())
-                                .and_then(|n| n.to_str())
-                                .map(|s| s.trim_start_matches('[').trim_end_matches(']').chars().count())
-                                .unwrap_or(4); // "help"
-                            (name_len, 1 + "[ACodeEditor]".len(), false)
-                        } else {
-                            let root = app.projects.projects
-                                .get(app.projects.active)
-                                .map(|p| p.root.clone());
-                            let ext = match (root, &ed.path) {
-                                (Some(r), Some(p)) => !p.starts_with(&r),
-                                _                  => false,
-                            };
-                            // `[NEW]` renders for on-disk-missing
-                            // buffers — same shape as PTY badges, so
-                            // size it in.
-                            use crate::editor::ExternalConflict as C;
-                            let mut badge_w = if ed.is_new {
-                                1 + "[NEW]".len()
-                            } else if ed.external_conflict == Some(C::ModifiedOnDisk) {
-                                1 + "[CONFLICT]".len()
-                            } else {
-                                0
-                            };
-                            if ed.external_conflict == Some(C::Deleted) {
-                                badge_w += 1 + "[DELETED]".len();
-                            }
-                            (ed.file_name().chars().count(), badge_w, ext)
-                        }
-                    }
-                    Some(Session::Shell(p))  => (pty_display_name(p, "shell").chars().count(),  1 + "[SHELL]".len(),  false),
-                    Some(Session::Claude(p)) => (pty_display_name(p, "claude").chars().count(), 1 + "[CLAUDE]".len(), false),
-                    Some(Session::Diff(v))     => (v.title.chars().count(), 0, false),
-                    Some(Session::Conflict(v)) => (v.title.chars().count(), 0, false),
-                    None => (0, 0, false),
-                };
-                title_len + badge_len + if external { "  [EXTERNAL]".chars().count() } else { 0 }
-            }
-            _ => e.path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.chars().count())
-                .unwrap_or(0),
-        };
-        depth_off + 2 + name_len + 2
-    }).max().unwrap_or(0);
-
-    // Git-panel rows — the widest source when a git sub-mode is active.
-    // Each case mirrors what the draw_* fn formats.
-    let git_max = match app.explorer_mode {
-        ExplorerMode::GitBranches => app.git.branches.iter()
-            .map(|b| 3 + b.chars().count() + 1) // " ● " + name + trailing slack
-            .max().unwrap_or(0),
-        ExplorerMode::GitChanges => app.git.change_rows().iter()
-            .map(|r| 5 + r.path.chars().count() + 1) // "   {marker} " + path
-            .max().unwrap_or(0),
-        ExplorerMode::GitLog => app.git_log.iter()
-            .map(|e| {
-                let top = 1 + e.sha_short.chars().count() + 2 + e.summary.chars().count();
-                let bot = 10 + e.author.chars().count() + 3 + e.when.chars().count();
-                top.max(bot)
-            })
-            .max().unwrap_or(0),
-        _ => 0,
-    };
-
-    let needed = tree_max.max(git_max) as u16;
-    needed.clamp(base, max)
+    let max = area.width.saturating_sub(40).max(HARD_MIN);
+    DEFAULT.min(max)
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -343,6 +245,11 @@ fn draw_cell(frame: &mut Frame, area: Rect, cell_idx: usize, app: &App) {
             } else {
                 frame.render_widget(&editor.textarea, inner);
             }
+        }
+        Session::Hex(view) => {
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            draw_hex(frame, inner, view, t, focused, &app.mode);
         }
         Session::Diff(view) => {
             let inner = block.inner(area);
@@ -492,6 +399,112 @@ fn draw_editor_wrapped(
             .and_then(|(r, line)| char_at_visual_col(line, r, cur_vcol))
             .unwrap_or(' ');
         buf.set_string(cx, screen_y, ch.to_string(), cursor_style);
+    }
+
+    // Completion popup overlay. Drawn last (after cursor) so it sits
+    // on top of any underlying content. Only on the focused cell —
+    // an unfocused buffer's stale popup would just be visual noise.
+    if focused {
+        if let Some(comp) = editor.completion.as_ref() {
+            draw_completion_popup(
+                frame, area, comp,
+                cur_vrow, cur_vcol, scroll_top, gutter_w as u16, theme,
+            );
+        }
+    }
+}
+
+fn draw_completion_popup(
+    frame:      &mut Frame,
+    area:       Rect,
+    comp:       &crate::editor::CompletionPopup,
+    cur_vrow:   usize,
+    cur_vcol:   u16,
+    scroll_top: usize,
+    gutter_w:   u16,
+    theme:      &Theme,
+) {
+    if comp.items.is_empty() { return; }
+    if cur_vrow < scroll_top { return; } // cursor scrolled off; skip popup
+
+    // Anchor the popup at the prefix's start, not the cursor — that's
+    // where the matching text *begins*, so the popup visually "owns"
+    // the word the user is completing. Falls back to cursor position
+    // if the visual offset can't be resolved (wrapped/multibyte edge).
+    let prefix_chars = comp.prefix.chars().count() as u16;
+    let anchor_col = cur_vcol.saturating_sub(prefix_chars);
+    let content_x = area.x + gutter_w;
+    let popup_x = content_x + anchor_col;
+
+    // Width: longest item, capped so a wide identifier doesn't push
+    // the popup off-cell. Min 6 so even short matches show something.
+    let max_w = comp.items.iter()
+        .map(|s| s.chars().count())
+        .max().unwrap_or(0);
+    let pad = 2; // 1-col left/right gutter
+    let avail = area.x + area.width - popup_x;
+    let width  = (max_w as u16 + pad).min(avail).min(40).max(6);
+
+    // Height: prefer below-cursor; flip above when there isn't room.
+    let visible: u16 = comp.items.len().min(8) as u16;
+    let cursor_y = area.y + (cur_vrow - scroll_top) as u16;
+    let below_room = area.y + area.height - cursor_y - 1;
+    let above_room = cursor_y - area.y;
+    let (popup_y, height) = if below_room >= visible {
+        (cursor_y + 1, visible)
+    } else if above_room >= visible {
+        (cursor_y - visible, visible)
+    } else if below_room >= above_room {
+        (cursor_y + 1, below_room.max(1))
+    } else {
+        let h = above_room.max(1);
+        (cursor_y - h, h)
+    };
+    if height == 0 { return; }
+
+    let buf = frame.buffer_mut();
+    let bg_normal   = Style::default().fg(theme.fg).bg(theme.bg_sel);
+    let bg_selected = Style::default().fg(theme.bg).bg(theme.accent);
+    let prefix_style_normal   = Style::default().fg(theme.accent).bg(theme.bg_sel);
+    let prefix_style_selected = Style::default().fg(theme.bg).bg(theme.accent);
+
+    // Pick a window of items around `selected` so it's always visible
+    // when the list is taller than the popup.
+    let total = comp.items.len();
+    let window = (height as usize).min(total);
+    let mut top = comp.selected.saturating_sub(window.saturating_sub(1));
+    if top + window > total { top = total - window; }
+
+    for (i, item) in comp.items.iter().enumerate().skip(top).take(window) {
+        let row_y = popup_y + (i - top) as u16;
+        let is_sel = i == comp.selected;
+        let row_style    = if is_sel { bg_selected }       else { bg_normal };
+        let prefix_style = if is_sel { prefix_style_selected } else { prefix_style_normal };
+
+        // Overwrite every cell in the row with a space + the popup
+        // style so the editor text underneath doesn't bleed through.
+        // `paint_bg` would only restyle (leaving glyphs intact), which
+        // is fine for selection shading but garbles a popup overlay.
+        let blank: String = " ".repeat(width as usize);
+        buf.set_string(popup_x, row_y, blank, row_style);
+        // Item: " prefix" in accent, "rest" in fg, both on popup bg.
+        let pre_len = comp.prefix.chars().count() as u16;
+        let item_x = popup_x + 1; // 1-col left padding
+        let max_item_w = width.saturating_sub(2);
+        if pre_len <= max_item_w {
+            buf.set_string(item_x, row_y, &comp.prefix, prefix_style);
+            let rest: String = item.chars().skip(comp.prefix.chars().count())
+                .take((max_item_w - pre_len) as usize)
+                .collect();
+            if !rest.is_empty() {
+                buf.set_string(item_x + pre_len, row_y, rest, row_style);
+            }
+        } else {
+            // Pathological: prefix wider than the popup. Just write
+            // a truncation of the whole item in the row style.
+            let truncated: String = item.chars().take(max_item_w as usize).collect();
+            buf.set_string(item_x, row_y, truncated, row_style);
+        }
     }
 }
 
@@ -945,6 +958,177 @@ fn draw_diff_lines(frame: &mut Frame, area: Rect, view: &crate::diff::DiffView, 
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// Render a Hex cell. Layout per row: `OFFSET  HH HH HH HH  HH HH HH HH … │ASCII│`.
+/// The ASCII pane is a read-only mirror — non-printable bytes show as
+/// `.`. Cursor is rendered as a solid block on the active nibble in the
+/// hex pane, with a dim mirror highlight on the same byte in the ASCII
+/// pane. Visual selection (when `view.anchor.is_some()`) paints `bg_sel`
+/// across the byte range on both panes.
+fn draw_hex(frame: &mut Frame, area: Rect, view: &crate::hex::HexView, t: &Theme, focused: bool, mode: &Mode) {
+    if area.width == 0 || area.height == 0 { return; }
+
+    // Reserve the bottom row for a status line.
+    let body_h = area.height.saturating_sub(1);
+    if body_h == 0 { return; }
+
+    // Pick bytes-per-row from cell width. Layout cost per row:
+    //   gutter(10) + groups*group_w(group_w = 4*3-1=11) + (groups-1)*2 + 3 + bpr.
+    // 16 bpr → 4 groups → 10 + 4*11 + 6 + 3 + 16 = 79.
+    //  8 bpr → 2 groups → 10 + 2*11 + 2 + 3 + 8 = 45.
+    //  4 bpr → 1 group  → 10 + 1*11 + 0 + 3 + 4 = 28.
+    let bpr: u16 = if area.width >= 79 { 16 } else if area.width >= 45 { 8 } else { 4 };
+    view.bytes_per_row.set(bpr);
+    view.viewport_rows.set(body_h);
+
+    let bpr_u = bpr as usize;
+    let total_bytes = view.bytes.len();
+    let total_rows  = (total_bytes + bpr_u - 1) / bpr_u;
+
+    // Adjust scroll so the cursor row is visible. Same shape as the
+    // editor's autoscroll: bring the cursor to the nearest edge.
+    let cursor_row = view.cursor / bpr_u;
+    let mut scroll = view.scroll.get();
+    if cursor_row < scroll {
+        scroll = cursor_row;
+    } else if cursor_row >= scroll + body_h as usize {
+        scroll = cursor_row + 1 - body_h as usize;
+    }
+    if scroll > total_rows.saturating_sub(1) {
+        scroll = total_rows.saturating_sub(1);
+    }
+    view.scroll.set(scroll);
+
+    let buf = frame.buffer_mut();
+    let dim_style    = Style::default().fg(t.dim).bg(t.bg);
+    let fg_style     = Style::default().fg(t.fg).bg(t.bg);
+    let muted_style  = Style::default().fg(t.muted).bg(t.bg);
+    let sep_style    = Style::default().fg(t.dim).bg(t.bg);
+    let sel_bg       = t.bg_sel;
+    let cursor_style = if focused {
+        // In Normal/Visual: solid accent block. In Insert: green like
+        // the rest of insert-mode UI.
+        let bg = if matches!(mode, Mode::Insert) { t.ok } else { t.accent };
+        Style::default().fg(t.bg).bg(bg).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(t.fg).bg(t.bg_sel)
+    };
+    let mirror_style = Style::default().fg(t.fg).bg(t.bg_sel);
+
+    let sel = view.selection_range();
+
+    for vy in 0..body_h {
+        let row_idx = scroll + vy as usize;
+        let row_start = row_idx * bpr_u;
+        if row_start >= total_bytes && row_idx > 0 { break; }
+        let y = area.y + vy;
+
+        // Gutter — 8 hex digits + 2 spaces.
+        let gutter = format!("{:08x}  ", row_start);
+        buf.set_string(area.x, y, &gutter, dim_style);
+        let mut x = area.x + gutter.chars().count() as u16;
+
+        // Hex pane. Iterate bytes_per_row slots even past EOF so empty
+        // cells render as blanks (keeps column alignment).
+        for col in 0..bpr_u {
+            let off = row_start + col;
+            // Group separator: extra space between groups of 4.
+            if col > 0 && col % 4 == 0 {
+                buf.set_string(x, y, " ", fg_style);
+                x += 1;
+            }
+            // Per-byte rendering.
+            let in_sel = sel.map_or(false, |(lo, hi)| off >= lo && off < hi);
+            let is_cursor = focused && off == view.cursor;
+            let pair = if off < total_bytes {
+                format!("{:02x}", view.bytes[off])
+            } else {
+                "  ".to_string()
+            };
+            // Two-character byte; cursor highlight may target only one
+            // nibble in Insert mode.
+            let mut hi_char = pair.chars().nth(0).unwrap_or(' ');
+            let mut lo_char = pair.chars().nth(1).unwrap_or(' ');
+            let base_style = if in_sel { fg_style.bg(sel_bg) } else { fg_style };
+            // Hi nibble cell.
+            let hi_style = if is_cursor && off < total_bytes
+                && (matches!(mode, Mode::Insert) || matches!(mode, Mode::Normal | Mode::Visual { .. }))
+                && view.nibble_high
+            {
+                cursor_style
+            } else if is_cursor && off < total_bytes && !matches!(mode, Mode::Insert) {
+                cursor_style
+            } else {
+                base_style
+            };
+            // Lo nibble cell — only the active nibble carries the cursor
+            // tint in Insert mode; in Normal/Visual the whole byte does.
+            let lo_style = if is_cursor && off < total_bytes && matches!(mode, Mode::Insert) && !view.nibble_high {
+                cursor_style
+            } else if is_cursor && off < total_bytes && !matches!(mode, Mode::Insert) {
+                cursor_style
+            } else {
+                base_style
+            };
+            // Render into the buffer.
+            buf.set_string(x,     y, hi_char.to_string(), hi_style);
+            buf.set_string(x + 1, y, lo_char.to_string(), lo_style);
+            // Trailing space between bytes within a group (skip after
+            // the last byte of a group; the group separator above adds
+            // its own padding).
+            let _ = (&mut hi_char, &mut lo_char);
+            let space_x = x + 2;
+            if col + 1 < bpr_u && (col + 1) % 4 != 0 {
+                buf.set_string(space_x, y, " ", base_style);
+            } else if col + 1 < bpr_u {
+                // First space of the group separator — second one
+                // comes from the col%4==0 branch on the next loop.
+            }
+            x += 3;
+        }
+
+        // Separator between hex pane and ASCII pane.
+        // x currently sits one past the last hex byte's space. Draw " │".
+        buf.set_string(x, y, " │", sep_style);
+        x += 2;
+
+        // ASCII pane.
+        for col in 0..bpr_u {
+            let off = row_start + col;
+            if off >= total_bytes {
+                buf.set_string(x, y, " ", fg_style);
+                x += 1;
+                continue;
+            }
+            let b = view.bytes[off];
+            let in_sel = sel.map_or(false, |(lo, hi)| off >= lo && off < hi);
+            let is_cursor = focused && off == view.cursor;
+            let (ch, style) = if (0x20..=0x7e).contains(&b) {
+                (b as char, fg_style)
+            } else {
+                ('.', muted_style)
+            };
+            let mut s = if in_sel { style.bg(sel_bg) } else { style };
+            if is_cursor { s = mirror_style; }
+            let mut tmp = [0u8; 4];
+            buf.set_string(x, y, ch.encode_utf8(&mut tmp), s);
+            x += 1;
+        }
+    }
+
+    // Status row at the bottom.
+    let sy = area.y + area.height - 1;
+    let status = format!(
+        "  0x{:08x}/0x{:08x}  {} bpr  {}",
+        view.cursor,
+        total_bytes.saturating_sub(1),
+        bpr,
+        if view.dirty { "modified" } else { "" },
+    );
+    let blank: String = " ".repeat(area.width as usize);
+    buf.set_string(area.x, sy, blank, dim_style);
+    buf.set_string(area.x, sy, status, dim_style);
+}
+
 /// Title line for a cell. Single session → just the label. Multiple
 /// sessions → `lbl1 · lbl2 · lbl3` with the active one styled like a
 /// focused tab and others dimmed. If the full tab strip won't fit in
@@ -1111,6 +1295,7 @@ fn badge_style_for(t: &Theme, badge: &str) -> Style {
     let c = match badge {
         "[CLAUDE]"      => t.warn,
         "[SHELL]"       => t.warn,
+        "[HEX]"         => t.info,
         "[ACodeEditor]" => Color::Rgb(0xc7, 0x8e, 0xff),
         "[NEW]"         => t.ok,
         // External-disk state — red + bold so the title row screams
@@ -1197,6 +1382,11 @@ fn cell_tab_parts(s: &Session) -> (String, Option<&'static str>) {
                 None
             };
             (format!("{name}{dirty}"), badge)
+        }
+        Session::Hex(h) => {
+            let dirty = if h.dirty { "*" } else { "" };
+            let name = h.file_name();
+            (format!("{name}{dirty}"), Some("[HEX]"))
         }
         Session::Diff(view) => (format!("diff · {}", view.title), None),
         Session::Conflict(view) => {
@@ -2276,6 +2466,17 @@ fn open_cell_line(e: &Entry, idx: usize, app: &App, width: usize) -> Line<'stati
         }
         Session::Shell(p)    => (pty_display_name(p, "shell"),  Some("[SHELL]"),  false, false, false, None),
         Session::Claude(p)   => (pty_display_name(p, "claude"), Some("[CLAUDE]"), false, false, false, None),
+        Session::Hex(h)      => {
+            let root = app.projects.projects
+                .get(app.projects.active)
+                .map(|p| p.root.clone());
+            let path = h.path.clone();
+            let external = match (&root, &path) {
+                (Some(r), Some(p)) => !p.starts_with(r),
+                _                  => false,
+            };
+            (h.file_name().to_string(), Some("[HEX]"), true, h.dirty, external, path)
+        }
         Session::Diff(v)     => (v.title.clone(), None, false, false, false, None),
         Session::Conflict(v) => (v.title.clone(), None, false, false, false, None),
     };
@@ -2724,6 +2925,7 @@ fn fill_focus_summary<'a>(left: &mut Vec<Span<'a>>, app: &'a App) {
                     Session::Claude(_)   => ("claude",   t.accent),
                     Session::Shell(_)    => ("shell",    t.accent),
                     Session::Edit(_)     => ("edit",     t.accent),
+                    Session::Hex(_)      => ("hex",      t.info),
                     Session::Diff(_)     => ("diff",     t.accent),
                     Session::Conflict(_) => ("conflict", t.err),
                 };
@@ -2774,6 +2976,12 @@ fn fill_focus_summary<'a>(left: &mut Vec<Span<'a>>, app: &'a App) {
                                 " resolved — :w",
                                 Style::default().fg(t.ok).bold(),
                             ));
+                        }
+                    }
+                    Session::Hex(h) => {
+                        left.push(Span::styled(format!(" · {}", h.file_name()), Style::default().fg(t.fg)));
+                        if h.dirty {
+                            left.push(Span::styled(" +", Style::default().fg(t.warn)));
                         }
                     }
                 }

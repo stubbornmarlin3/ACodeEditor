@@ -101,22 +101,11 @@ pub struct PtySession {
     last_output_ms: Arc<AtomicU64>,
     /// OS pid of the shell/claude process we spawned. Used by
     /// `is_busy()` to detect silent long-running children (e.g. a dev
-    /// server waiting for file changes): if the shell has any
-    /// descendant processes still alive, something is running even if
-    /// no output is flowing. `None` when portable-pty couldn't hand us
-    /// a pid (rare — usually a spawn race).
+    /// server waiting for file changes): any non-shell, non-helper
+    /// descendant means something is running even if no output is
+    /// flowing. `None` when portable-pty couldn't hand us a pid (rare
+    /// — usually a spawn race).
     child_pid: Option<u32>,
-    /// Epoch-millis the child process was spawned — used to skip the
-    /// descendant check during the first `BUSY_BASELINE_MS` window so
-    /// we can capture an idle-state baseline before claiming busy.
-    spawn_ms: u64,
-    /// Descendant count captured after the startup window elapses.
-    /// `usize::MAX` means "not captured yet." The busy check compares
-    /// the current descendant count against this and only flags busy
-    /// when there are *additional* descendants — required because
-    /// wrappers like Git Bash's `bin/bash.exe` launch an inner bash
-    /// that permanently sits as a descendant even when idle.
-    baseline_descendants: AtomicUsize,
     /// Pre-rendered `Buffer` snapshot of the current screen. Built by
     /// the reader thread right after each `parser.process`, and also
     /// rebuilt synchronously on scroll / resize (operations that
@@ -125,12 +114,6 @@ pub struct PtySession {
     /// `Arc::clone` — a pointer bump, no per-cell work.
     pub snapshot: Arc<Mutex<Option<Arc<PtySnapshot>>>>,
 }
-
-/// Delay after spawn before we trust the descendant-count baseline.
-/// Short enough that a user can't easily start a command in the window;
-/// long enough that shell wrappers (Git Bash launcher → inner bash)
-/// have settled into their steady-state process tree.
-const BUSY_BASELINE_MS: u64 = 1500;
 
 impl PtySession {
     pub fn spawn_shell(rows: u16, cols: u16, cwd: Option<&Path>, tx: Sender<AppEvent>) -> Result<Self> {
@@ -194,50 +177,23 @@ impl PtySession {
     /// True iff the child hasn't exited AND either:
     ///   * the child produced output in the last 500ms (Claude
     ///     spinner, streaming build, prompt redraw), or
-    ///   * the shell has at least one live descendant process (a
-    ///     silent dev server like `npm run dev` waiting on FS events,
-    ///     a `sleep`, a command blocked on stdin).
+    ///   * the shell has a user-launched descendant alive (a silent
+    ///     dev server like `npm run dev`, a `sleep`, a blocked
+    ///     command) — i.e. a descendant process whose name isn't a
+    ///     known shell or pty-host helper.
     ///
-    /// The descendant check is what catches the "silent but running"
-    /// case output-recency alone misses. Used by `:q` / `:Q` to refuse
-    /// closing a cell while work is in flight (forcing `:q!`).
+    /// Used by `:q` / `:Q` to refuse closing a cell while work is in
+    /// flight (forcing `:q!`). False negatives are preferable to
+    /// false positives — a stuck `:q` is worse than closing a truly
+    /// idle shell.
     pub fn is_busy(&self) -> bool {
         if self.has_exited() { return false; }
         let last = self.last_output_ms.load(Ordering::Relaxed);
         if last != 0 && now_ms().saturating_sub(last) < 500 {
             return true;
         }
-        self.has_live_descendants()
-    }
-
-    /// True when the shell process has one or more descendant
-    /// processes alive (children, grandchildren, etc.). Walks the
-    /// full process table once and follows parent pids transitively,
-    /// which is the only cross-platform way to catch double-forked
-    /// daemons — a `node` spawned by `npm` whose direct parent is a
-    /// helper process, etc.
-    ///
-    /// Returns `false` if we don't have a pid (spawn race) or if
-    /// sysinfo can't enumerate (shouldn't happen on supported
-    /// platforms). False negatives are preferable to false positives
-    /// here — a stuck `:q` is worse than closing a truly idle shell.
-    fn has_live_descendants(&self) -> bool {
         let Some(root) = self.child_pid else { return false; };
-        // Startup window: don't trust the baseline yet. Return false so
-        // the user can actually close a freshly-opened shell without
-        // waiting. Once the window elapses, capture the steady-state
-        // count as the baseline and use it from then on.
-        let elapsed = now_ms().saturating_sub(self.spawn_ms);
-        if elapsed < BUSY_BASELINE_MS {
-            return false;
-        }
-        let current = count_real_descendants(root);
-        let baseline = self.baseline_descendants.load(Ordering::Relaxed);
-        if baseline == usize::MAX {
-            self.baseline_descendants.store(current, Ordering::Relaxed);
-            return false;
-        }
-        current > baseline
+        count_user_descendants(root) > 0
     }
 
     fn spawn(
@@ -308,8 +264,6 @@ impl PtySession {
             exited,
             last_output_ms,
             child_pid,
-            spawn_ms: now_ms(),
-            baseline_descendants: AtomicUsize::new(usize::MAX),
             snapshot,
         };
         // Seed the snapshot so the first frame has something to blit
@@ -984,27 +938,45 @@ fn cell_style_from_vt100(cell: &vt100::Cell) -> Style {
     style.add_modifier(mods)
 }
 
-/// Names of processes ConPTY (Windows) attaches to every pseudoterminal
-/// for console-host emulation. These persist for the pty's lifetime
-/// regardless of whether the user is running anything, so the busy
-/// heuristic must ignore them. Matched case-insensitively, with or
-/// without the `.exe` suffix depending on how sysinfo reports it.
-fn is_pty_host_helper(name: &str) -> bool {
-    let stem = name
-        .rsplit(['/', '\\'])
+/// Executables that belong to the PTY infrastructure itself — they
+/// appear in every pty's process tree regardless of what the user is
+/// doing, so the busy heuristic must ignore them. Matched
+/// case-insensitively with the `.exe` suffix stripped.
+const PTY_HOST_HELPERS: &[&str] = &["conhost", "openconsole"];
+
+/// Interactive shells we treat as "transparent" containers: a shell
+/// sitting at its prompt isn't user-launched work. This filters out
+/// Git Bash's inner-bash wrapper (bash.exe launcher → bin/bash.exe)
+/// and any subshell the user might have `exec`'d. Trade-off: if the
+/// user manually opens a subshell and walks away, we'll call the pty
+/// idle — acceptable vs. the alternative of Git Bash reading busy
+/// forever.
+const SHELL_NAMES: &[&str] = &[
+    "bash", "sh", "zsh", "fish", "dash", "ksh",
+    "cmd", "powershell", "pwsh", "nu", "xonsh",
+];
+
+fn name_stem(name: &str) -> String {
+    name.rsplit(['/', '\\'])
         .next()
         .unwrap_or(name)
         .trim_end_matches(".exe")
-        .trim_end_matches(".EXE");
-    stem.eq_ignore_ascii_case("conhost") || stem.eq_ignore_ascii_case("openconsole")
+        .trim_end_matches(".EXE")
+        .to_ascii_lowercase()
 }
 
-/// Number of descendant processes of `root` that aren't ConPTY
-/// console-host helpers. Walks the full process table once and
+fn is_idle_process(stem: &str) -> bool {
+    PTY_HOST_HELPERS.iter().any(|n| *n == stem)
+        || SHELL_NAMES.iter().any(|n| *n == stem)
+}
+
+/// Count descendants of `root` that look like user-launched work —
+/// i.e. any process in the tree whose executable name isn't a known
+/// shell or pty-host helper. Walks the full process table once and
 /// expands the "ours" set transitively by parent pid, so double-
 /// forked children are included. Returns 0 on any sysinfo failure
 /// (safer to under-report than to over-report busy).
-fn count_real_descendants(root: u32) -> usize {
+fn count_user_descendants(root: u32) -> usize {
     use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
     let sys = System::new_with_specifics(
         RefreshKind::new().with_processes(ProcessRefreshKind::new()),
@@ -1028,7 +1000,7 @@ fn count_real_descendants(root: u32) -> usize {
     ours.iter().filter(|pid| {
         if **pid == root_pid { return false; }
         let Some(proc) = sys.process(**pid) else { return false; };
-        !is_pty_host_helper(proc.name().to_string_lossy().as_ref())
+        !is_idle_process(&name_stem(proc.name().to_string_lossy().as_ref()))
     }).count()
 }
 

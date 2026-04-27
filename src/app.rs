@@ -5,6 +5,7 @@ use ratatui::layout::Rect;
 use crate::cell::{Cell, LayoutMode, Session, SessionKind};
 use crate::editor::Editor;
 use crate::events::AppEvent;
+use crate::hex::HexView;
 use crate::explorer::FileTree;
 use crate::git::{self, ChangeRow, MultiRepo};
 use crate::projects::ProjectList;
@@ -332,6 +333,12 @@ pub struct App {
     /// `space+0` jump or another `e` toggle.
     pub explorer_hidden: bool,
 
+    /// `true` expands the explorer to the full terminal width (cells
+    /// column collapses to 0). Mutually exclusive with `explorer_hidden`
+    /// — setting one clears the other. Toggled with `F` on the focused
+    /// explorer.
+    pub explorer_fullscreen: bool,
+
     /// Native filesystem watcher for real-time reconciliation. `None`
     /// if the OS refused to create one — the slow poll tick still
     /// functions as a fallback.
@@ -471,13 +478,10 @@ impl App {
         };
 
         // Active-project cwd: when `projects` is non-empty, `cd` to the
-        // active project root so git + new PTYs start there. With no
-        // active project and no file args, fall back to the user's home
-        // directory so PTYs don't inherit whatever dir `ace` was launched
-        // from (e.g. `cargo run` sitting inside this repo).
-        let target_cwd = projects.projects.get(projects.active).map(|p| p.root.clone())
-            .or_else(|| if startup.files.is_empty() { home_dir() } else { None });
-        if let Some(dir) = target_cwd {
+        // active project root so git + new PTYs start there. Otherwise
+        // keep the launch cwd — running `ace` in a directory should
+        // stay in that directory.
+        if let Some(dir) = projects.projects.get(projects.active).map(|p| p.root.clone()) {
             let _ = std::env::set_current_dir(&dir);
         }
         let git_cwd = std::env::current_dir().unwrap_or_else(|_| cwd.clone());
@@ -528,6 +532,7 @@ impl App {
             tx,
 
             explorer_hidden,
+            explorer_fullscreen: false,
             fs_watcher:        crate::events::start_fs_watcher(tx_for_watcher),
             watched:           HashSet::new(),
             last_saved_hash:   0,
@@ -664,6 +669,16 @@ impl App {
 
     pub fn focused_editor_mut(&mut self) -> Option<&mut Editor> {
         self.focused_cell_mut()?.active_session_mut().as_editor_mut()
+    }
+
+    pub fn focused_hex_mut(&mut self) -> Option<&mut HexView> {
+        self.focused_cell_mut()?.active_session_mut().as_hex_mut()
+    }
+
+    pub fn focused_session_is_hex(&self) -> bool {
+        self.focused_cell()
+            .map(|c| matches!(c.active_session(), Session::Hex(_)))
+            .unwrap_or(false)
     }
 
     pub fn focused_session_is_editor(&self) -> bool {
@@ -1035,15 +1050,35 @@ impl App {
             return;
         }
         self.explorer_hidden = !self.explorer_hidden;
-        if self.explorer_hidden && self.focus == FocusId::Explorer {
-            let idx = self.last_cell_focus.min(self.cells.len() - 1);
-            self.set_focus(FocusId::Cell(idx));
+        if self.explorer_hidden {
+            // Hidden and fullscreen are mutually exclusive — clear one
+            // when the other wins so state can't drift.
+            self.explorer_fullscreen = false;
+            if self.focus == FocusId::Explorer {
+                let idx = self.last_cell_focus.min(self.cells.len() - 1);
+                self.set_focus(FocusId::Cell(idx));
+            }
         }
         self.status.push_auto(if self.explorer_hidden {
             "explorer hidden (space+0 to show)".into()
         } else {
             "explorer shown".into()
         });
+    }
+
+    /// Expand/collapse the explorer to/from full-terminal width. Cells
+    /// aren't rendered while fullscreen — their column collapses to 0.
+    /// Bound to `F` on the focused explorer. Reveals + focuses the
+    /// explorer if it was hidden, so the toggle is always meaningful.
+    pub fn toggle_explorer_fullscreen(&mut self) {
+        self.explorer_fullscreen = !self.explorer_fullscreen;
+        if self.explorer_fullscreen {
+            self.explorer_hidden = false;
+            self.set_focus(FocusId::Explorer);
+            self.status.push_auto("explorer fullscreen (F to exit)".into());
+        } else {
+            self.status.push_auto("explorer windowed".into());
+        }
     }
 
     /// PageUp/PageDown in the Explorer — switch to the previous/next
@@ -1149,7 +1184,20 @@ impl App {
                         cv.commit_edit();
                     }
                 }
-                Session::Edit(ed) => ed.end_insert(),
+                Session::Edit(ed) => {
+                    ed.end_insert();
+                    // Visual→Normal: cancel the textarea selection so
+                    // the highlight clears on the same Esc that flipped
+                    // the mode. Without this the user would have to
+                    // press Esc again — first Esc lands here and only
+                    // changes mode; second Esc reaches handle_normal
+                    // which clears the selection.
+                    ed.textarea.cancel_selection();
+                }
+                Session::Hex(h) => {
+                    h.cancel_selection();
+                    h.nibble_high = true;
+                }
                 Session::Claude(pty) | Session::Shell(pty) => {
                     pty.clear_visual();
                     pty.pending_g = false;
@@ -1474,7 +1522,10 @@ impl App {
             "wq" | "x"                          => self.cmd_write_quit(),
             "wQ"                                => self.cmd_write_quit_app(false),
             "wQ!"                               => self.cmd_write_quit_app(true),
-            "e!" | "edit!"                      => self.cmd_edit_force(),
+            "e!" | "edit!"                      => self.cmd_edit_force(false),
+            "edit" | "e"                        => self.cmd_edit_toggle(false),
+            "hex"                               => self.cmd_hex_toggle(false),
+            "hex!"                              => self.cmd_hex_toggle(true),
             "conflict" | "resolve"              => self.cmd_conflict(),
             "close" | "bd" | "bdelete"          => self.cmd_close(false),
             "close!" | "bd!" | "bdelete!"       => self.cmd_close(true),
@@ -1485,6 +1536,14 @@ impl App {
             "set nowrap"                        => self.cmd_set_wrap(false),
             "set list"                          => self.cmd_set_list(true),
             "set nolist"                        => self.cmd_set_list(false),
+            "set autopair"                      => self.cmd_set_autopair(true),
+            "set noautopair"                    => self.cmd_set_autopair(false),
+            "set autoindent"                    => self.cmd_set_autoindent(true),
+            "set noautoindent"                  => self.cmd_set_autoindent(false),
+            "set expandtab"                     => self.cmd_set_expandtab(true),
+            "set noexpandtab"                   => self.cmd_set_expandtab(false),
+            "set completion"                    => self.cmd_set_completion(true),
+            "set nocompletion"                  => self.cmd_set_completion(false),
             "layout"                           => self.status.push_auto("usage: :layout master".into()),
             "swap"                              => self.status.push_auto("usage: :swap <1..9> | 0 (minimize)".into()),
             "min" | "minimize"                  => self.minimize_focused(),
@@ -1506,6 +1565,10 @@ impl App {
             _ if cmd.starts_with("e ") || cmd.starts_with("edit ") => {
                 let path = cmd.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
                 self.cmd_edit(path);
+            }
+            _ if cmd.starts_with("hex ") => {
+                let path = cmd.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
+                self.cmd_hex_path(path);
             }
             _ if cmd.starts_with("new ") => {
                 let rest = cmd.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
@@ -1562,6 +1625,34 @@ impl App {
     }
 
     fn cmd_write(&mut self, force: bool) {
+        // Hex cell focus: route the save through HexView. Same conflict
+        // guard as the Edit branch below — refuse a plain `:w` if the
+        // file changed on disk and the user hasn't acked it with `:w!`.
+        if self.focused_session_is_hex() {
+            if !force {
+                if let Some(c) = self.focused_hex_mut().and_then(|h| h.external_conflict) {
+                    use crate::hex::ExternalConflict as C;
+                    let hint = match c {
+                        C::ModifiedOnDisk => "disk changed — :w! to overwrite, :e! to reload",
+                        C::Deleted        => "disk file gone — :w! to recreate",
+                    };
+                    self.status.push_auto(hint.into());
+                    return;
+                }
+            }
+            let out = self.focused_hex_mut().map(|h| (h.save(), h.file_name().to_string()));
+            match out {
+                Some((Ok(()), name)) => {
+                    self.refresh_git();
+                    let prefix = if force { "forced " } else { "" };
+                    self.status.push_auto(format!("{prefix}wrote {name}"));
+                }
+                Some((Err(e), _)) => self.status.push_auto(format!("write failed: {e}")),
+                None              => self.status.push_auto(":w needs editor focus".into()),
+            }
+            return;
+        }
+
         // If a Conflict cell is focused, `:w` writes the resolved
         // output to disk. Partially-resolved files write with the
         // remaining hunks defaulting to "keep ours" — we warn but
@@ -1753,6 +1844,25 @@ impl App {
     /// `/pattern` — forward search in the focused editor. Called by
     /// `run_command` when the command buffer starts with `/` or `?`.
     fn cmd_search(&mut self, pattern: &str, backward: bool) {
+        // Hex cell focus — search for the literal ASCII bytes of the
+        // pattern. Matches keep the cursor at the byte offset of the
+        // first byte of the match.
+        if self.focused_session_is_hex() {
+            if pattern.is_empty() {
+                let ok = self.focused_hex_mut().map(|h| h.search_next(backward));
+                if let Some(false) = ok {
+                    self.status.push_auto("no previous search".into());
+                }
+                return;
+            }
+            let ok = self.focused_hex_mut().map(|h| h.set_search_and_find(pattern));
+            match ok {
+                Some(true)  => self.status.push_auto(format!("/{pattern}")),
+                Some(false) => self.status.push_auto(format!("no match: {pattern}")),
+                None        => self.status.push_auto("search needs editor focus".into()),
+            }
+            return;
+        }
         if pattern.is_empty() {
             // Empty pattern: repeat the last search in the chosen direction.
             let ok = self.focused_editor_mut().map(|ed| ed.search_next(backward));
@@ -1801,6 +1911,52 @@ impl App {
         }
     }
 
+    /// `:set autopair` / `:set noautopair` — toggle bracket/quote
+    /// autoclosing on the focused editor.
+    fn cmd_set_autopair(&mut self, on: bool) {
+        if let Some(ed) = self.focused_editor_mut() {
+            ed.autopair = on;
+            self.status.push_auto(if on { "autopair on".into() } else { "autopair off".into() });
+        } else {
+            self.status.push_auto(":set autopair needs editor focus".into());
+        }
+    }
+
+    /// `:set autoindent` / `:set noautoindent` — toggle smart Enter /
+    /// `o` / `O` indent inheritance on the focused editor.
+    fn cmd_set_autoindent(&mut self, on: bool) {
+        if let Some(ed) = self.focused_editor_mut() {
+            ed.autoindent = on;
+            self.status.push_auto(if on { "autoindent on".into() } else { "autoindent off".into() });
+        } else {
+            self.status.push_auto(":set autoindent needs editor focus".into());
+        }
+    }
+
+    /// `:set expandtab` / `:set noexpandtab` — toggle whether Tab in
+    /// insert mode inserts spaces or a literal tab.
+    fn cmd_set_expandtab(&mut self, on: bool) {
+        if let Some(ed) = self.focused_editor_mut() {
+            ed.expandtab = on;
+            self.status.push_auto(if on { "expandtab on".into() } else { "expandtab off".into() });
+        } else {
+            self.status.push_auto(":set expandtab needs editor focus".into());
+        }
+    }
+
+    /// `:set completion` / `:set nocompletion` — toggle the
+    /// buffer-word completion popup on the focused editor. Disabling
+    /// also clears any active popup.
+    fn cmd_set_completion(&mut self, on: bool) {
+        if let Some(ed) = self.focused_editor_mut() {
+            ed.completion_enabled = on;
+            if !on { ed.completion = None; }
+            self.status.push_auto(if on { "completion on".into() } else { "completion off".into() });
+        } else {
+            self.status.push_auto(":set completion needs editor focus".into());
+        }
+    }
+
     /// `:help` — open a read-only editor cell prefilled with the ace
     /// reference card. Re-invoking focuses the existing help cell
     /// instead of stacking more copies.
@@ -1824,17 +1980,180 @@ impl App {
     }
 
     /// `:e!` — discard local buffer and reload the file from disk.
-    /// Resolves a `ModifiedOnDisk` conflict in favour of disk.
-    fn cmd_edit_force(&mut self) {
+    /// Resolves a `ModifiedOnDisk` conflict in favour of disk. When the
+    /// focused cell is a Hex cell, this is also the lossy escape hatch
+    /// for switching back to text on a buffer with invalid UTF-8.
+    fn cmd_edit_force(&mut self, _was_force_arg: bool) {
+        // Hex focus: behave as `:edit!` toggle — convert to text via
+        // lossy UTF-8 (replacement chars for invalid bytes).
+        if self.focused_session_is_hex() {
+            self.cmd_edit_toggle(true);
+            return;
+        }
+        // Pull the editor's path up front so we can fall back to hex on
+        // an invalid-UTF-8 reload without re-borrowing.
+        let editor_path = self.focused_editor_mut().and_then(|e| e.path.clone());
         let out = self.focused_editor_mut().map(|ed| {
             let r = ed.reload_from_disk();
             (r, ed.file_name().to_string())
         });
         match out {
             Some((Ok(()),  name)) => self.status.push_auto(format!("reloaded {name}")),
-            Some((Err(e),  _))    => self.status.push_auto(format!("reload failed: {e}")),
-            None                  => self.status.push_auto(":e! needs editor focus".into()),
+            Some((Err(e),  name)) => {
+                if let (Some(path), FocusId::Cell(idx)) = (editor_path, self.focus) {
+                    match std::fs::read(&path) {
+                        Ok(bytes) => {
+                            let hv = HexView::from_bytes(Some(path.clone()), bytes, false, false);
+                            let active = self.cells[idx].active;
+                            self.cells[idx].sessions[active] = Session::Hex(hv);
+                            self.status.push_auto(format!("{name}: binary file — opened in hex mode"));
+                            return;
+                        }
+                        Err(e2) => {
+                            self.status.push_auto(format!("reload failed: {e2}"));
+                            return;
+                        }
+                    }
+                }
+                self.status.push_auto(format!("reload failed: {e}"));
+            }
+            None => self.status.push_auto(":e! needs editor focus".into()),
         }
+    }
+
+    /// `:edit` (no path) — when focused on a Hex cell, swap it back to
+    /// an Edit cell using the buffer's bytes as UTF-8 text. If `lossy`
+    /// (the `:edit!` form) is true, invalid UTF-8 is rendered with
+    /// replacement chars; otherwise refuse with a hint.
+    fn cmd_edit_toggle(&mut self, lossy: bool) {
+        let FocusId::Cell(idx) = self.focus else {
+            self.status.push_auto(":edit toggle needs a focused hex cell".into());
+            return;
+        };
+        let Some(_hv) = self.cells[idx].active_session_mut().as_hex_mut() else {
+            self.status.push_auto(":edit toggle needs a focused hex cell (try :hex first)".into());
+            return;
+        };
+        let hv = self.cells[idx].active_session_mut().as_hex_mut().unwrap();
+        let path = hv.path.clone();
+        let dirty = hv.dirty;
+        let is_new = hv.is_new;
+        let text = if lossy {
+            hv.to_text_lossy()
+        } else {
+            match hv.to_text() {
+                Ok(s)  => s,
+                Err(_) => {
+                    self.status.push_auto("non-UTF-8 bytes — :edit! to discard (lossy)".into());
+                    return;
+                }
+            }
+        };
+        let mut ed = Editor::empty();
+        if let Some(p) = path.as_ref() {
+            // Best-effort: load from disk to seed mtime/size; then
+            // overwrite the textarea contents with the buffer-derived
+            // text so unsaved hex edits are preserved.
+            let _ = ed.load(p);
+        }
+        let lines: Vec<String> = if text.is_empty() {
+            vec![String::new()]
+        } else {
+            text.lines().map(String::from).collect()
+        };
+        ed.textarea = tui_textarea::TextArea::new(lines);
+        crate::editor::style_textarea(&mut ed.textarea);
+        ed.dirty = dirty;
+        ed.is_new = is_new;
+        ed.syntax = path.as_deref().and_then(crate::syntax::SyntaxHighlighter::new);
+        ed.syntax_stale = true;
+        let name = ed.file_name().to_string();
+        let active = self.cells[idx].active;
+        self.cells[idx].sessions[active] = Session::Edit(ed);
+        self.mode = self.natural_mode_for_focus();
+        self.status.push_auto(format!("{name}: switched to edit mode"));
+    }
+
+    /// `:hex` (no path) — toggle the focused Edit cell into Hex mode,
+    /// carrying the dirty buffer across as raw UTF-8 bytes. `force` is
+    /// reserved (no current use; keeps symmetry with `:edit!`).
+    fn cmd_hex_toggle(&mut self, _force: bool) {
+        let FocusId::Cell(idx) = self.focus else {
+            self.status.push_auto(":hex needs a focused editor cell".into());
+            return;
+        };
+        let Some(ed) = self.cells[idx].active_session_mut().as_editor_mut() else {
+            // Already a Hex cell? Toggle back to Edit, like vim's
+            // mode-toggle dual: `:hex` on a hex view drops you back.
+            if self.focused_session_is_hex() {
+                self.cmd_edit_toggle(false);
+                return;
+            }
+            self.status.push_auto(":hex needs an editor cell".into());
+            return;
+        };
+        if ed.read_only {
+            self.status.push_auto(":hex on read-only buffer is not supported".into());
+            return;
+        }
+        let path = ed.path.clone();
+        let mut text = ed.textarea.lines().join("\n");
+        if !text.is_empty() && !text.ends_with('\n') {
+            // Match save_to behaviour so the byte view matches what `:w`
+            // would produce from the same buffer.
+            text.push('\n');
+        }
+        let dirty = ed.dirty;
+        let is_new = ed.is_new;
+        let bytes = text.into_bytes();
+        let hv = HexView::from_bytes(path, bytes, dirty, is_new);
+        let name = hv.file_name().to_string();
+        let active = self.cells[idx].active;
+        self.cells[idx].sessions[active] = Session::Hex(hv);
+        self.mode = self.natural_mode_for_focus();
+        self.status.push_auto(format!("{name}: switched to hex mode"));
+    }
+
+    /// `:hex <path>` — open a file directly in Hex mode. Replaces the
+    /// focused Edit/Hex cell when one for this path is already open;
+    /// otherwise creates a new cell.
+    fn cmd_hex_path(&mut self, path: &str) {
+        if path.is_empty() {
+            self.status.push_auto("usage: :hex <path>".into());
+            return;
+        }
+        let expanded = expand_tilde(path);
+        let p = std::path::Path::new(&expanded);
+        if p.is_dir() {
+            self.status.push_auto(format!("{} is a directory", p.display()));
+            return;
+        }
+        let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+        let mut hv = HexView::empty();
+        if let Err(e) = hv.load(&abs) {
+            self.status.push_auto(format!("open failed: {e}"));
+            return;
+        }
+        let name = hv.file_name().to_string();
+        // If a cell already has this path open (Edit or Hex), swap it in
+        // place rather than spawning a duplicate.
+        let existing = self.cells.iter().position(|c| {
+            matches!(c.active_session(), Session::Edit(e) if e.path.as_deref() == Some(abs.as_path()))
+                || matches!(c.active_session(), Session::Hex(h) if h.path.as_deref() == Some(abs.as_path()))
+        });
+        if let Some(idx) = existing {
+            let active = self.cells[idx].active;
+            self.cells[idx].sessions[active] = Session::Hex(hv);
+            self.set_focus(FocusId::Cell(idx));
+            self.status.push_auto(format!("opened {name} in hex mode"));
+            return;
+        }
+        if self.cells.len() >= MAX_CELLS {
+            self.status.push_auto(format!("max {MAX_CELLS} cells"));
+            return;
+        }
+        self.insert_cell_at_top(Cell::with_session(Session::Hex(hv)));
+        self.status.push_auto(format!("opened {name} in hex mode"));
     }
 
     /// `:w <path>` — save the focused editor to `path`, adopting that
@@ -1850,6 +2169,18 @@ impl App {
         let p = std::path::Path::new(&expanded).to_path_buf();
         if p.is_dir() {
             self.status.push_auto(format!("{} is a directory", p.display()));
+            return;
+        }
+        if self.focused_session_is_hex() {
+            let out = self.focused_hex_mut().map(|h| (h.save_as(&p), h.file_name().to_string()));
+            match out {
+                Some((Ok(()), _))  => {
+                    self.refresh_git();
+                    self.status.push_auto(format!("wrote {path}"));
+                }
+                Some((Err(e), _)) => self.status.push_auto(format!("write failed: {e}")),
+                None              => self.status.push_auto(":w <path> needs editor focus".into()),
+            }
             return;
         }
         let out = self.focused_editor_mut().map(|ed| (ed.save_as(&p), ed.file_name().to_string()));
@@ -2080,10 +2411,31 @@ impl App {
                             format!("opened {name}")
                         };
                         self.status.push_auto(msg);
+                        return;
                     }
-                    Err(e)  => self.status.push_auto(format!("open failed: {e}")),
+                    Err(_)  => {
+                        // Binary fallback — invalid UTF-8 (or another
+                        // text-decode failure). Replace the focused
+                        // editor's session with a Hex cell so the file
+                        // is still openable.
+                        if let FocusId::Cell(idx) = self.focus {
+                            match std::fs::read(p) {
+                                Ok(bytes) => {
+                                    let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+                                    let hv = HexView::from_bytes(Some(abs), bytes, false, false);
+                                    let active = self.cells[idx].active;
+                                    self.cells[idx].sessions[active] = Session::Hex(hv);
+                                    self.status.push_auto(format!("{name}: binary file — opened in hex mode"));
+                                    return;
+                                }
+                                Err(e2) => {
+                                    self.status.push_auto(format!("open failed: {e2}"));
+                                    return;
+                                }
+                            }
+                        }
+                    }
                 }
-                return;
             }
         }
         // Otherwise create a new cell with an editor for this file.
@@ -2103,7 +2455,18 @@ impl App {
                 };
                 self.status.push_auto(msg);
             }
-            Err(e) => self.status.push_auto(format!("open failed: {e}")),
+            Err(_) => {
+                // Binary fallback — open as hex.
+                match std::fs::read(p) {
+                    Ok(bytes) => {
+                        let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+                        let hv = HexView::from_bytes(Some(abs), bytes, false, false);
+                        self.insert_cell_at_top(Cell::with_session(Session::Hex(hv)));
+                        self.status.push_auto(format!("{name}: binary file — opened in hex mode"));
+                    }
+                    Err(e2) => self.status.push_auto(format!("open failed: {e2}")),
+                }
+            }
         }
     }
 
@@ -2402,9 +2765,33 @@ impl App {
                     if p.is_dir() {
                         return Err(format!("{} is a directory", p.display()));
                     }
-                    ed.load(p).map_err(|e| format!("open failed: {e}"))?;
+                    match ed.load(p) {
+                        Ok(()) => {}
+                        Err(_) => {
+                            // Binary fallback: invalid UTF-8 (or other
+                            // non-text decode failure) opens as Hex so
+                            // every file is reachable through `:new edit`.
+                            let bytes = std::fs::read(p)
+                                .map_err(|e2| format!("open failed: {e2}"))?;
+                            let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+                            let hv = HexView::from_bytes(Some(abs), bytes, false, false);
+                            return Ok(Session::Hex(hv));
+                        }
+                    }
                 }
                 Ok(Session::Edit(ed))
+            }
+            SessionKind::Hex => {
+                let mut hv = HexView::empty();
+                if !rest.is_empty() {
+                    let expanded = expand_tilde(rest);
+                    let p = std::path::Path::new(&expanded);
+                    if p.is_dir() {
+                        return Err(format!("{} is a directory", p.display()));
+                    }
+                    hv.load(p).map_err(|e| format!("open failed: {e}"))?;
+                }
+                Ok(Session::Hex(hv))
             }
             // Diff sessions aren't user-spawnable from `:new diff` —
             // they're always the result of `v` on a change/log entry,
@@ -2447,21 +2834,39 @@ impl App {
         let mut any_deleted = false;
         for cell in self.cells.iter_mut() {
             for sess in cell.sessions.iter_mut() {
-                let Session::Edit(ed) = sess else { continue; };
-                if ed.path.as_deref() != Some(path) {
-                    continue;
-                }
-                let name = ed.file_name().to_string();
-                match ed.reconcile() {
-                    ReconcileOutcome::AutoReloaded =>
-                        status = Some(format!("{name}: reloaded from disk")),
-                    ReconcileOutcome::ConflictMarked =>
-                        status = Some(format!("{name}: changed on disk — :e! reload, :w! overwrite")),
-                    ReconcileOutcome::Deleted => {
-                        status = Some(format!("{name}: deleted on disk — :w to recreate"));
-                        any_deleted = true;
+                match sess {
+                    Session::Edit(ed) => {
+                        if ed.path.as_deref() != Some(path) { continue; }
+                        let name = ed.file_name().to_string();
+                        match ed.reconcile() {
+                            ReconcileOutcome::AutoReloaded =>
+                                status = Some(format!("{name}: reloaded from disk")),
+                            ReconcileOutcome::ConflictMarked =>
+                                status = Some(format!("{name}: changed on disk — :e! reload, :w! overwrite")),
+                            ReconcileOutcome::Deleted => {
+                                status = Some(format!("{name}: deleted on disk — :w to recreate"));
+                                any_deleted = true;
+                            }
+                            ReconcileOutcome::NoOp => {}
+                        }
                     }
-                    ReconcileOutcome::NoOp => {}
+                    Session::Hex(hv) => {
+                        if hv.path.as_deref() != Some(path) { continue; }
+                        use crate::hex::ReconcileOutcome as R;
+                        let name = hv.file_name().to_string();
+                        match hv.reconcile() {
+                            R::AutoReloaded =>
+                                status = Some(format!("{name}: reloaded from disk")),
+                            R::ConflictMarked =>
+                                status = Some(format!("{name}: changed on disk — :e! reload, :w! overwrite")),
+                            R::Deleted => {
+                                status = Some(format!("{name}: deleted on disk — :w to recreate"));
+                                any_deleted = true;
+                            }
+                            R::NoOp => {}
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2548,29 +2953,24 @@ impl App {
         self.projects.projects.get(self.projects.active).map(|p| p.root.clone())
     }
 
-    /// Called from the main loop when `cells` has gone empty. If another
-    /// project is open, switch to it (its parked cells or `.acedata`
-    /// come back up) rather than quitting. Returns `true` if a switch
-    /// happened — the caller should skip the `should_quit` flip.
+    /// Called from the main loop when `cells` has gone empty. Closing
+    /// the last cell in a project closes the project itself — if others
+    /// are open, `project_close_idx` swaps in project 0; if this was the
+    /// only project, the caller flips `should_quit` on the next tick.
+    /// Returns `true` if another project took over.
     pub fn try_switch_project_on_empty(&mut self) -> bool {
         if self.cells.is_empty() && self.projects.projects.len() > 1 {
-            let cur = self.projects.active;
-            let next = (cur + 1) % self.projects.projects.len();
-            let next_root = self.projects.projects[next].root.clone();
-            let next_name = self.projects.projects[next].name.clone();
-            self.switch_to_project_idx(next, &next_root, false);
-            self.status.push_auto(format!("closed last cell → {next_name}"));
-            return true;
+            self.project_close_idx(self.projects.active);
+            return !self.cells.is_empty();
         }
         false
     }
 
     /// Working directory to hand to a newly-spawned shell or claude PTY.
-    /// Prefers the active project root; falls back to the user's home
-    /// directory so shells never inherit whatever dir `ace` was launched
-    /// from (especially `target/debug` under `cargo run`).
+    /// Prefers the active project root; otherwise inherits ace's current
+    /// cwd (which is the launch directory when there's no project).
     pub fn pty_cwd(&self) -> Option<PathBuf> {
-        self.current_project_root().or_else(home_dir)
+        self.current_project_root()
     }
 
     /// Pipe the last output line of every running ephemeral (`:ex`) pty
@@ -2720,6 +3120,10 @@ impl App {
                         Some(p) => (SessionKind::Edit, Some(p)),
                         None    => continue, // scratch — nothing to persist
                     },
+                    Session::Hex(h)    => match h.path.clone() {
+                        Some(p) => (SessionKind::Hex, Some(p)),
+                        None    => continue,
+                    },
                     Session::Diff(_)     => continue, // ephemeral
                     Session::Conflict(_) => continue, // ephemeral; re-derives from disk
                 };
@@ -2851,6 +3255,13 @@ impl App {
                 .ok().map(Session::Shell),
             SessionKind::Claude => PtySession::spawn_claude(rows, cols, self.pty_cwd().as_deref(), self.tx.clone())
                 .ok().map(Session::Claude),
+            SessionKind::Hex => {
+                let mut hv = HexView::empty();
+                if let Some(p) = state.path.as_ref() {
+                    let _ = hv.load(p);
+                }
+                Some(Session::Hex(hv))
+            }
             SessionKind::Diff     => None, // never persisted
             SessionKind::Conflict => None, // never persisted
         }
@@ -3734,7 +4145,17 @@ impl App {
 
     // ── git: path-based actions ──────────────────────────────────────────
 
+    /// Cwd for git ops. Routes to the *active* discovered repo's
+    /// workdir so nested repos under a project root get their own
+    /// commands (status, stage, commit, …) targeted correctly. Falls
+    /// back to the process cwd when no repo has been discovered yet
+    /// (e.g. `:git init` in a fresh dir).
     fn git_cwd(&self) -> std::path::PathBuf {
+        if let Some(repo) = self.git.active() {
+            if let Some(wd) = repo.workdir.as_ref() {
+                return wd.clone();
+            }
+        }
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
     }
 
@@ -4346,6 +4767,7 @@ fn hint_switch_failure(target: &str, raw: &str) -> String {
 /// target needs the force-close flag.
 fn cell_active_editor_is_dirty(cell: &Cell) -> bool {
     matches!(cell.active_session(), Session::Edit(e) if e.dirty)
+        || matches!(cell.active_session(), Session::Hex(h) if h.dirty)
 }
 
 /// If the cell's active session is a claude/shell PTY currently
@@ -4537,6 +4959,7 @@ fn kind_label(k: SessionKind) -> &'static str {
         SessionKind::Claude   => "claude",
         SessionKind::Shell    => "shell",
         SessionKind::Edit     => "edit",
+        SessionKind::Hex      => "hex",
         SessionKind::Diff     => "diff",
         SessionKind::Conflict => "conflict",
     }

@@ -48,6 +48,7 @@ const TOP_LEVEL: &[&str] = &[
     "conflict", "resolve",
     "edit", "edit!", "e", "e!",
     "git",
+    "hex", "hex!",
     "help", "h",
     "layout",
     "new",
@@ -97,7 +98,13 @@ pub fn complete(buffer: &str, ctx: &CompletionCtx) -> Completion {
     let args: Vec<&str> = words.collect();
 
     match head {
-        "set"    => starts_with_into(&["wrap", "nowrap", "list", "nolist"], token, token_start),
+        "set"    => starts_with_into(
+            &["wrap", "nowrap", "list", "nolist",
+              "autopair", "noautopair", "autoindent", "noautoindent",
+              "expandtab", "noexpandtab",
+              "completion", "nocompletion"],
+            token, token_start,
+        ),
         "layout" => starts_with_into(
             &["master-bottom", "mb", "master-right", "mr", "master-stack", "ms"],
             token, token_start,
@@ -109,20 +116,23 @@ pub fn complete(buffer: &str, ctx: &CompletionCtx) -> Completion {
         "e" | "edit" | "e!" | "edit!" => {
             Completion { start: token_start, options: path_options(token, ctx.cwd, true) }
         }
+        "hex" | "hex!" => {
+            Completion { start: token_start, options: path_options(token, ctx.cwd, true) }
+        }
         "w" | "write" | "w!" | "write!" => {
             Completion { start: token_start, options: path_options(token, ctx.cwd, false) }
         }
 
         "new" | "tab" => {
             if args.is_empty() {
-                starts_with_into(&["shell", "claude", "edit"], token, token_start)
+                starts_with_into(&["shell", "claude", "edit", "hex"], token, token_start)
             } else {
                 // `edit` takes a file (directories aren't openable);
                 // `shell`/`claude` aren't wired to a cwd arg yet so we
                 // show nothing rather than hint at a feature that
                 // silently no-ops.
                 match args[0] {
-                    "edit" => Completion { start: token_start, options: path_options(token, ctx.cwd, true) },
+                    "edit" | "hex" => Completion { start: token_start, options: path_options(token, ctx.cwd, true) },
                     _      => Completion::default(),
                 }
             }
@@ -339,7 +349,7 @@ mod tests {
     fn new_kind_suggestions() {
         let c = complete("new ", &ctx());
         assert_eq!(c.start, 4);
-        assert_eq!(c.options, vec!["claude", "edit", "shell"]);
+        assert_eq!(c.options, vec!["claude", "edit", "hex", "shell"]);
         let c = complete("new sh", &ctx());
         assert_eq!(c.options, vec!["shell"]);
     }
@@ -347,7 +357,12 @@ mod tests {
     #[test]
     fn set_suggestions() {
         let c = complete("set ", &ctx());
-        assert_eq!(c.options, vec!["list", "nolist", "nowrap", "wrap"]);
+        assert_eq!(
+            c.options,
+            vec!["autoindent", "autopair", "completion", "expandtab", "list",
+                 "noautoindent", "noautopair", "nocompletion", "noexpandtab", "nolist",
+                 "nowrap", "wrap"],
+        );
     }
 
     #[test]

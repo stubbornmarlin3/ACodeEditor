@@ -8,6 +8,7 @@ mod editor;
 mod events;
 mod explorer;
 mod git;
+mod hex;
 mod projects;
 mod session;
 mod session_state;
@@ -369,8 +370,8 @@ fn run(
     // previous iteration. The PTY resize itself is nearly free when all
     // sizes match, but the preceding `ui::layout` walk + iteration over
     // every session still cost something per tick.
-    let mut last_layout_key: (Rect, usize, cell::LayoutMode, bool) = (
-        Rect::default(), usize::MAX, app.layout_mode, app.explorer_hidden,
+    let mut last_layout_key: (Rect, usize, cell::LayoutMode, bool, bool) = (
+        Rect::default(), usize::MAX, app.layout_mode, app.explorer_hidden, app.explorer_fullscreen,
     );
     while !app.should_quit {
         // Block only as long as the next status message needs to stay
@@ -441,7 +442,7 @@ fn run(
         // Gate on the inputs that could change geometry; the common case
         // is they haven't, and we skip the layout walk entirely.
         let term = current_term_rect();
-        let key = (term, app.cells.len(), app.layout_mode, app.explorer_hidden);
+        let key = (term, app.cells.len(), app.layout_mode, app.explorer_hidden, app.explorer_fullscreen);
         if key != last_layout_key {
             resize_ptys_if_needed(app, term);
             last_layout_key = key;
@@ -589,6 +590,7 @@ fn current_cell_title(app: &App) -> String {
                 }
                 S::Diff(v)       => format!("diff · {}", v.title),
                 S::Conflict(v)   => format!("conflict · {}", v.title),
+                S::Hex(h)        => format!("hex · {}", h.file_name()),
             }
         }
     }
@@ -627,7 +629,7 @@ thread_local! {
         = const { std::cell::Cell::new(None) };
 }
 
-const DOUBLE_CLICK_MS: u128 = 400;
+const DOUBLE_CLICK_MS: u128 = 250;
 
 fn hit_test(app: &App, x: u16, y: u16) -> Option<ClickTarget> {
     let term = current_term_rect();
@@ -809,6 +811,9 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
 fn scroll_cell(app: &mut App, i: usize, dir: i32) {
     let vcursor_mode = matches!(app.mode, Mode::Normal | Mode::Visual { .. });
     let Some(cell) = app.cells.get_mut(i) else { return; };
+    // Lines per wheel tick. Matches typical editor feel — 1 line feels
+    // laggy, a full page is disorienting.
+    const WHEEL_LINES: i16 = 3;
     match cell.active_session_mut() {
         cell::Session::Claude(p) | cell::Session::Shell(p) => {
             if vcursor_mode {
@@ -820,7 +825,23 @@ fn scroll_cell(app: &mut App, i: usize, dir: i32) {
                 p.scroll_by(-dir as isize);
             }
         }
-        cell::Session::Edit(_) | cell::Session::Diff(_) | cell::Session::Conflict(_) => {}
+        cell::Session::Edit(ed) => {
+            ed.scroll_lines(dir as i16 * WHEEL_LINES);
+        }
+        cell::Session::Diff(d) => {
+            d.scroll(dir as isize * WHEEL_LINES as isize);
+        }
+        cell::Session::Conflict(_) => {}
+        cell::Session::Hex(h) => {
+            // One row of bytes per wheel tick.
+            let bpr = h.bytes_per_row.get().max(1) as isize;
+            let n = h.bytes.len();
+            if n == 0 { return; }
+            let step = (dir as isize) * bpr * (WHEEL_LINES as isize);
+            let cur = h.cursor as isize;
+            let nx = (cur + step).clamp(0, (n - 1) as isize);
+            h.cursor = nx as usize;
+        }
     }
 }
 
@@ -934,6 +955,17 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         && key.modifiers == KeyModifiers::NONE
         && matches!(app.mode, Mode::Insert | Mode::Visual { .. })
     {
+        // First Esc with a live completion popup just closes the popup
+        // and keeps insert mode armed — second Esc exits to Normal.
+        // Mirrors what most IDEs do and lets the user back out of an
+        // unwanted suggestion without losing the entry point.
+        if matches!(app.mode, Mode::Insert) {
+            if let Some(ed) = app.focused_editor_mut() {
+                if ed.try_dismiss_completion() {
+                    return;
+                }
+            }
+        }
         app.enter_normal();
         return;
     }
@@ -987,6 +1019,47 @@ fn handle_visual(app: &mut App, key: KeyEvent) {
             PtyAction::None       => {}
         }
         return;
+    }
+
+    // Hex Visual — own handler. Byte-range selection. `y` copies the
+    // selected bytes to the clipboard as a space-separated hex string;
+    // the clipboard call has to happen out here (HexView itself can't
+    // touch the OS).
+    if app.focused_session_is_hex() {
+        if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Char('y') {
+            let yank = app.focused_hex_mut().and_then(|h| {
+                let (lo, hi) = h.selection_range()?;
+                let bytes = h.bytes.get(lo..hi)?.to_vec();
+                h.cancel_selection();
+                Some(bytes)
+            });
+            if let Some(bytes) = yank {
+                let n = bytes.len();
+                let hex: String = bytes.iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                match clipboard_set(&hex) {
+                    Ok(())  => app.status.push_auto(format!("yanked {n} bytes")),
+                    Err(e)  => app.status.push_auto(format!("clipboard: {e}")),
+                }
+            } else {
+                app.status.push_auto("nothing to yank".into());
+            }
+            app.mode = Mode::Normal;
+            return;
+        }
+        if let Some(h) = app.focused_hex_mut() {
+            use crate::hex::HexVisualAction;
+            let act = h.handle_visual(key);
+            let msg = h.take_status();
+            match act {
+                HexVisualAction::Stay => {}
+                HexVisualAction::Exit => { app.mode = Mode::Normal; }
+            }
+            if let Some(m) = msg { app.status.push_auto(m); }
+            return;
+        }
     }
 
     let linewise = matches!(app.mode, Mode::Visual { linewise: true });
@@ -1326,6 +1399,11 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Hex cell: own Normal-mode handler. Owns h/j/k/l, x, gg/G, v, i/a.
+    if handle_hex_cell_normal(app, key) {
+        return;
+    }
+
     // Space-arm for `<leader>+digit` jumps. Matched up here so the
     // editor's normal-mode handler below doesn't swallow the space
     // (it's not a vim motion but we also don't want to leak it into
@@ -1333,6 +1411,37 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
     if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Char(' ') {
         app.pending_jump = true;
         return;
+    }
+
+    // Hex-focused? Same `/` `?` `n` `N` shape as editors — match this
+    // branch first so `n` as a motion in the hex view (we don't define
+    // one) doesn't get swallowed by the hex normal handler below.
+    if app.focused_session_is_hex() {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Char('/')) => {
+                app.enter_command_with("/"); return;
+            }
+            (KeyModifiers::NONE, KeyCode::Char('?')) => {
+                app.enter_command_with("?"); return;
+            }
+            (KeyModifiers::NONE, KeyCode::Char('n')) => {
+                if let Some(h) = app.focused_hex_mut() {
+                    if !h.search_next(false) {
+                        app.status.push_auto("no match".into());
+                    }
+                }
+                return;
+            }
+            (m, KeyCode::Char('N')) if m.contains(KeyModifiers::SHIFT) => {
+                if let Some(h) = app.focused_hex_mut() {
+                    if !h.search_next(true) {
+                        app.status.push_auto("no match".into());
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
     }
 
     // Editor-focused? Search keys have first claim — `n`/`N` in vim are
@@ -1480,6 +1589,24 @@ fn handle_conflict_cell(app: &mut App, key: KeyEvent) -> bool {
     consumed
 }
 
+/// Keys while a Hex cell is focused in Normal mode. Returns `true` if
+/// the key was consumed. Routes through `HexView::handle_normal` which
+/// returns the action (None / EnterInsert / EnterVisual) for the outer
+/// dispatcher to flip mode.
+fn handle_hex_cell_normal(app: &mut App, key: KeyEvent) -> bool {
+    use crate::hex::HexAction;
+    let Some(h) = app.focused_hex_mut() else { return false; };
+    let act = h.handle_normal(key);
+    let msg = h.take_status();
+    match act {
+        HexAction::None         => {}
+        HexAction::EnterInsert  => app.mode = Mode::Insert,
+        HexAction::EnterVisual  => app.mode = Mode::Visual { linewise: false },
+    }
+    if let Some(m) = msg { app.status.push_auto(m); }
+    true
+}
+
 /// Keys while a Diff cell is focused in Normal mode. Scroll-only
 /// (read-only view). Returns true if consumed.
 fn handle_diff_cell(app: &mut App, key: KeyEvent) -> bool {
@@ -1507,6 +1634,9 @@ fn handle_explorer_normal(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('j') | KeyCode::Down => { app.explorer.move_down(); true }
         KeyCode::Char('k') | KeyCode::Up   => { app.explorer.move_up();   true }
         KeyCode::Enter                      => { activate_explorer_row(app); true }
+        // `F` — fullscreen toggle. Expands the explorer to the full
+        // terminal; `F` again restores the sidebar layout.
+        KeyCode::Char('F') => { app.toggle_explorer_fullscreen(); true }
         // `e` — open selected file in a fresh cell and focus it
         // (distinct from Enter, which previews without leaving the
         // explorer). No-op on non-file rows.
@@ -1732,11 +1862,24 @@ fn open_file_in_cell(app: &mut App, path: std::path::PathBuf) {
                 app.set_focus(FocusId::Cell(idx));   // commits the preview
                 app.status.push_auto(format!("opened {name}"));
                 app.on_sessions_changed();
+                return;
             }
-            Some(Err(e)) => app.status.push_auto(format!("open failed: {e}")),
-            None         => app.status.push_auto("open failed: no editor".into()),
+            Some(Err(_)) => {
+                // Binary fallback — swap the cell's editor session for
+                // a hex view so the file is still openable.
+                if let Some(sess) = build_hex_session_for(&path) {
+                    let active = app.cells[idx].active;
+                    app.cells[idx].sessions[active] = sess;
+                    app.set_focus(FocusId::Cell(idx));
+                    app.status.push_auto(format!("{name}: binary file — opened in hex mode"));
+                    app.on_sessions_changed();
+                    return;
+                }
+                app.status.push_auto(format!("open failed: {name}"));
+                return;
+            }
+            None => { app.status.push_auto("open failed: no editor".into()); return; }
         }
-        return;
     }
 
     if app.cells.len() >= app::MAX_CELLS {
@@ -1751,8 +1894,26 @@ fn open_file_in_cell(app: &mut App, path: std::path::PathBuf) {
             app.status.push_auto(format!("opened {name}"));
             app.persist_cells();
         }
-        Err(e) => app.status.push_auto(format!("open failed: {e}")),
+        Err(_) => {
+            if let Some(sess) = build_hex_session_for(&path) {
+                app.insert_cell_at_top(Cell::with_session(sess));
+                app.preview_cell_idx = None;
+                app.status.push_auto(format!("{name}: binary file — opened in hex mode"));
+                app.persist_cells();
+            } else {
+                app.status.push_auto(format!("open failed: {name}"));
+            }
+        }
     }
+}
+
+/// Read `path` into a `Session::Hex` for the explorer's binary
+/// fallback. `None` when the file can't be read at all (permission,
+/// missing, etc.) — those errors should surface as plain open-failed.
+fn build_hex_session_for(path: &std::path::Path) -> Option<Session> {
+    let bytes = std::fs::read(path).ok()?;
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    Some(Session::Hex(crate::hex::HexView::from_bytes(Some(abs), bytes, false, false)))
 }
 
 /// Load `path` into the preview slot without stealing focus from the
@@ -1770,11 +1931,22 @@ fn preview_file(app: &mut App, path: std::path::PathBuf) {
                 app.preview_cell_idx = Some(idx);
                 app.status.push_auto(format!("preview {name}"));
                 app.on_sessions_changed();
+                return;
             }
-            Some(Err(e)) => app.status.push_auto(format!("preview failed: {e}")),
-            None         => app.status.push_auto("preview failed: no editor".into()),
+            Some(Err(_)) => {
+                if let Some(sess) = build_hex_session_for(&path) {
+                    let active = app.cells[idx].active;
+                    app.cells[idx].sessions[active] = sess;
+                    app.preview_cell_idx = Some(idx);
+                    app.status.push_auto(format!("{name}: binary file — preview in hex mode"));
+                    app.on_sessions_changed();
+                    return;
+                }
+                app.status.push_auto(format!("preview failed: {name}"));
+                return;
+            }
+            None => { app.status.push_auto("preview failed: no editor".into()); return; }
         }
-        return;
     }
 
     if app.cells.len() >= app::MAX_CELLS {
@@ -1789,7 +1961,16 @@ fn preview_file(app: &mut App, path: std::path::PathBuf) {
             app.status.push_auto(format!("preview {name}"));
             app.persist_cells();
         }
-        Err(e) => app.status.push_auto(format!("preview failed: {e}")),
+        Err(_) => {
+            if let Some(sess) = build_hex_session_for(&path) {
+                app.insert_cell_at_top_raw(Cell::with_session(sess));
+                app.preview_cell_idx = Some(0);
+                app.status.push_auto(format!("{name}: binary file — preview in hex mode"));
+                app.persist_cells();
+            } else {
+                app.status.push_auto(format!("preview failed: {name}"));
+            }
+        }
     }
 }
 
@@ -1809,6 +1990,11 @@ fn handle_insert(app: &mut App, key: KeyEvent) {
 
     if let Some(ed) = app.focused_editor_mut() {
         ed.handle_insert(key);
+        return;
+    }
+
+    if let Some(h) = app.focused_hex_mut() {
+        h.handle_insert(key);
         return;
     }
 

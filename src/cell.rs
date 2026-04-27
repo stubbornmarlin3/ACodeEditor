@@ -3,6 +3,7 @@ use ratatui::layout::Rect;
 use crate::conflict::ConflictView;
 use crate::diff::DiffView;
 use crate::editor::Editor;
+use crate::hex::HexView;
 use crate::session::PtySession;
 
 /// Kind of a single session. Claude and Shell are both PTY-backed but
@@ -15,6 +16,7 @@ pub enum SessionKind {
     Claude,
     Shell,
     Edit,
+    Hex,
     Diff,
     Conflict,
 }
@@ -25,6 +27,7 @@ impl SessionKind {
             "claude" | "c"                     => Some(SessionKind::Claude),
             "shell"  | "sh" | "s"              => Some(SessionKind::Shell),
             "edit"   | "editor" | "e"          => Some(SessionKind::Edit),
+            "hex"                               => Some(SessionKind::Hex),
             "diff"   | "d"                      => Some(SessionKind::Diff),
             "conflict" | "resolve"              => Some(SessionKind::Conflict),
             _ => None,
@@ -38,6 +41,7 @@ pub enum Session {
     Claude(PtySession),
     Shell(PtySession),
     Edit(Editor),
+    Hex(HexView),
     Diff(DiffView),
     Conflict(ConflictView),
 }
@@ -60,6 +64,13 @@ impl Session {
     pub fn as_editor_mut(&mut self) -> Option<&mut Editor> {
         match self {
             Session::Edit(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    pub fn as_hex_mut(&mut self) -> Option<&mut HexView> {
+        match self {
+            Session::Hex(h) => Some(h),
             _ => None,
         }
     }

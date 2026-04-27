@@ -194,6 +194,7 @@ fn kind_str(k: SessionKind) -> &'static str {
         SessionKind::Claude   => "claude",
         SessionKind::Shell    => "shell",
         SessionKind::Edit     => "edit",
+        SessionKind::Hex      => "hex",
         SessionKind::Diff     => "diff",
         SessionKind::Conflict => "conflict",
     }

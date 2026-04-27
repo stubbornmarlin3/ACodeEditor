@@ -18,6 +18,16 @@ pub enum ExternalConflict {
     Deleted,
 }
 
+/// Buffer-word completion popup. Items are full words; the user already
+/// typed `prefix`, so accepting splices `items[selected][prefix.len()..]`
+/// into the buffer at the cursor (which is parked right after `prefix`).
+#[derive(Debug, Clone)]
+pub struct CompletionPopup {
+    pub items:    Vec<String>,
+    pub selected: usize,
+    pub prefix:   String,
+}
+
 /// Vim operators that compose with a motion (or a text object) to form
 /// a change. `Yank` only copies — it never enters insert — so it shares
 /// most of the plumbing with `Delete`/`Change` but branches at the
@@ -242,6 +252,30 @@ pub struct Editor {
     pub gj_sticky: Cell<Option<GjSticky>>,
     /// `:set list` — render tabs / trailing spaces / EOL markers.
     pub list_mode: bool,
+    /// `:set autopair` (default on). When typing an opener (`(`, `[`,
+    /// `{`, `"`, `'`, `` ` ``) the matching closer is inserted and the
+    /// cursor parked between them; typing the closer when it already
+    /// sits at the cursor steps over it; Backspace inside an empty pair
+    /// deletes both sides.
+    pub autopair: bool,
+    /// `:set autoindent` (default on). Enter copies the previous line's
+    /// leading whitespace; if the char before the cursor is `{`, `(`,
+    /// or `[` the new line gets one extra level; if Enter is pressed
+    /// between matched pairs (e.g. `{|}`) the closer drops to its own
+    /// line and the cursor sits on a blank, indented middle line.
+    pub autoindent: bool,
+    /// `:set expandtab` (default on). Tab in insert mode inserts four
+    /// spaces; with `noexpandtab` it inserts a literal tab. Shift-Tab
+    /// always dedents one step regardless of this setting.
+    pub expandtab: bool,
+    /// `:set completion` (default on). When true, typing a 2+ char
+    /// identifier prefix in insert mode auto-arms a popup of matching
+    /// words drawn from the current buffer.
+    pub completion_enabled: bool,
+    /// Active completion popup, if any. Refreshed at the end of every
+    /// insert-mode keystroke; `None` when there's no eligible prefix or
+    /// no candidates.
+    pub completion: Option<CompletionPopup>,
     /// Viewport height (in rows) the renderer last used. Drives `zt` /
     /// `zz` / `zb` so we can reposition the cursor row within the
     /// window without a round-trip through the render pipeline.
@@ -284,6 +318,11 @@ impl Editor {
             last_content_w: Cell::new(0),
             gj_sticky: Cell::new(None),
             list_mode: false,
+            autopair: true,
+            autoindent: true,
+            expandtab: true,
+            completion_enabled: true,
+            completion: None,
             last_viewport_h: Cell::new(0),
             insert_entry: None,
             insert_buffer: String::new(),
@@ -346,6 +385,11 @@ impl Editor {
             last_content_w: Cell::new(0),
             gj_sticky: Cell::new(None),
             list_mode: false,
+            autopair: true,
+            autoindent: true,
+            expandtab: true,
+            completion_enabled: true,
+            completion: None,
             last_viewport_h: Cell::new(0),
             insert_entry: None,
             insert_buffer: String::new(),
@@ -524,6 +568,27 @@ impl Editor {
 
     /// Called while App.mode == Insert and focus is Edit.
     pub fn handle_insert(&mut self, key: KeyEvent) {
+        // Cycle/accept routes don't move the cursor in a way that would
+        // change the completion prefix, so they don't need a refresh.
+        // All other paths fall through to `dispatch` then refresh.
+        let popup_was_open = self.completion.is_some();
+        let popup_consumed_key = popup_was_open && matches!(
+            key.code,
+            KeyCode::Tab | KeyCode::Down |
+            KeyCode::BackTab | KeyCode::Up |
+            KeyCode::Enter
+        );
+        self.handle_insert_dispatch(key);
+        if !popup_consumed_key {
+            if self.completion_enabled {
+                self.refresh_completion();
+            } else {
+                self.completion = None;
+            }
+        }
+    }
+
+    fn handle_insert_dispatch(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Esc { return; }
         if self.read_only { return; }
         // First keystroke on the welcome page demotes it: wipe the
@@ -536,6 +601,26 @@ impl Editor {
             self.saved_hash  = hash_lines(&self.saved_lines);
             self.is_welcome = false;
         }
+        // Popup-active key handling. Sits BEFORE capture/autopair so
+        // Tab/Enter cycling and accepting take priority over the
+        // indent-step Tab and smart-newline Enter behaviours below.
+        if self.completion.is_some() {
+            match key.code {
+                KeyCode::Tab | KeyCode::Down => {
+                    self.cycle_completion(1);
+                    return;
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    self.cycle_completion(-1);
+                    return;
+                }
+                KeyCode::Enter => {
+                    self.accept_completion();
+                    return;
+                }
+                _ => {}
+            }
+        }
         // Capture the raw text that lands in the buffer so `.` can
         // replay the whole "entry + typed text + Esc" sequence.
         if self.insert_entry.is_some() {
@@ -547,10 +632,280 @@ impl Editor {
                 _ => {}
             }
         }
+        // Autopair lane — only intercepts plain (no Ctrl/Alt) key events
+        // where it has something to do; everything else falls through to
+        // tui-textarea's normal Input handling.
+        let plain = !key.modifiers.intersects(
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+        );
+        if self.autopair && plain {
+            match key.code {
+                KeyCode::Char(c) if is_autopair_char(c) => {
+                    self.type_char_autopair(c);
+                    self.recompute_dirty();
+                    return;
+                }
+                KeyCode::Backspace if self.try_autopair_backspace() => {
+                    self.recompute_dirty();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if self.autoindent && plain && key.code == KeyCode::Enter {
+            self.smart_newline();
+            self.recompute_dirty();
+            return;
+        }
+        // Tab → one indent step. With expandtab (default) that's four
+        // spaces; otherwise a literal tab. The capture loop above
+        // pushed `'\t'` for `.`-replay, so when we substitute spaces
+        // we have to rewrite the last byte of insert_buffer to keep
+        // replay aligned with what the buffer actually received.
+        if plain && key.code == KeyCode::Tab {
+            let step: &str = if self.expandtab { "    " } else { "\t" };
+            if self.insert_entry.is_some() && self.expandtab {
+                self.insert_buffer.pop(); // drop the '\t' just captured
+                self.insert_buffer.push_str(step);
+            }
+            self.textarea.insert_str(step);
+            self.recompute_dirty();
+            return;
+        }
+        // Shift-Tab dedents the current line, regardless of cursor
+        // column. Structural, so it doesn't get captured for `.`.
+        if key.code == KeyCode::BackTab {
+            self.dedent_current_line();
+            self.recompute_dirty();
+            return;
+        }
         let input = Input::from(key);
         if self.textarea.input(input) {
             self.recompute_dirty();
         }
+    }
+
+    /// Insert `c` with autopair semantics. Caller is responsible for
+    /// `recompute_dirty` afterwards.
+    fn type_char_autopair(&mut self, c: char) {
+        let (next, prev) = self.surrounding_chars();
+        let is_open  = matches!(c, '(' | '[' | '{');
+        let is_close = matches!(c, ')' | ']' | '}');
+        let is_quote = matches!(c, '"' | '\'' | '`');
+
+        // Skip-over: typing a closer or quote that already sits to the
+        // right of the cursor steps past it instead of duplicating.
+        // Without this the autopaired closer would force the user to
+        // either delete it or arrow past it, which defeats the purpose.
+        if (is_close || is_quote) && next == Some(c) {
+            self.textarea.move_cursor(CursorMove::Forward);
+            return;
+        }
+
+        // Quotes only pair when neither neighbour is a word char, so
+        // apostrophes mid-word ("don't") and quotes typed inside an
+        // identifier don't sprout a stray closer.
+        let pair = if is_open {
+            true
+        } else if is_quote {
+            let is_word = |ch: char| ch.is_alphanumeric() || ch == '_';
+            !prev.is_some_and(is_word) && !next.is_some_and(is_word)
+        } else {
+            false
+        };
+
+        if pair {
+            let close = match c { '(' => ')', '[' => ']', '{' => '}', q => q };
+            self.textarea.insert_char(c);
+            self.textarea.insert_char(close);
+            self.textarea.move_cursor(CursorMove::Back);
+        } else {
+            self.textarea.insert_char(c);
+        }
+    }
+
+    /// Backspace inside an empty matched pair deletes both halves.
+    /// Returns `true` when it consumed the keystroke.
+    fn try_autopair_backspace(&mut self) -> bool {
+        let (next, prev) = self.surrounding_chars();
+        let matched = matches!(
+            (prev, next),
+            (Some('('), Some(')'))
+            | (Some('['), Some(']'))
+            | (Some('{'), Some('}'))
+            | (Some('"'), Some('"'))
+            | (Some('\''), Some('\''))
+            | (Some('`'), Some('`'))
+        );
+        if !matched { return false; }
+        self.textarea.delete_next_char();
+        self.textarea.delete_char();
+        true
+    }
+
+    /// Insert a newline that preserves the current line's leading
+    /// whitespace, optionally bumping one level when the cursor sits
+    /// just after an opener and splitting when it sits between a
+    /// matched pair.
+    fn smart_newline(&mut self) {
+        let (row, col) = self.textarea.cursor();
+        let line = &self.textarea.lines()[row];
+        let line_chars: Vec<char> = line.chars().collect();
+        let prev = if col == 0 { None } else { line_chars.get(col - 1).copied() };
+        let next = line_chars.get(col).copied();
+
+        // Use the *current* line's existing indent as the baseline so
+        // breaking mid-line stays aligned with the block, matching what
+        // most editors do. Tabs vs. spaces is detected from that prefix
+        // — we don't try to be smart about mixed indentation.
+        let base: String = line.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+        let step: &str = if base.starts_with('\t') { "\t" } else { "    " };
+
+        let between_pair = matches!(
+            (prev, next),
+            (Some('{'), Some('}')) | (Some('('), Some(')')) | (Some('['), Some(']'))
+        );
+        let after_opener = matches!(prev, Some('{') | Some('(') | Some('['));
+
+        if between_pair {
+            // `{|}` → `{\n    \n}` with cursor on the indented middle.
+            // We emit the closer line first then walk the cursor back
+            // up so the user lands ready to type the block body.
+            self.textarea.insert_newline();
+            self.textarea.insert_str(&base);
+            self.textarea.move_cursor(CursorMove::Up);
+            self.textarea.move_cursor(CursorMove::End);
+            self.textarea.insert_newline();
+            let mut indent = base.clone();
+            indent.push_str(step);
+            self.textarea.insert_str(&indent);
+        } else if after_opener {
+            self.textarea.insert_newline();
+            let mut indent = base.clone();
+            indent.push_str(step);
+            self.textarea.insert_str(&indent);
+        } else {
+            self.textarea.insert_newline();
+            if !base.is_empty() {
+                self.textarea.insert_str(&base);
+            }
+        }
+    }
+
+    /// Recompute the completion popup against the current cursor
+    /// context. Closes it when the prefix is shorter than two chars,
+    /// when there are no buffer-local matches, or when the only match
+    /// is the prefix itself.
+    fn refresh_completion(&mut self) {
+        let (row, col) = self.textarea.cursor();
+        let line = match self.textarea.lines().get(row) {
+            Some(l) => l,
+            None => { self.completion = None; return; }
+        };
+        let chars: Vec<char> = line.chars().collect();
+        let mut start = col.min(chars.len());
+        while start > 0 && is_word_char(chars[start - 1]) {
+            start -= 1;
+        }
+        let prefix: String = chars[start..col.min(chars.len())].iter().collect();
+        if prefix.chars().count() < 2 {
+            self.completion = None;
+            return;
+        }
+
+        // Buffer-local word index. Cheap enough to rebuild per keystroke
+        // for normal-sized files; revisit if it ever shows up in profiles.
+        let mut items: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for l in self.textarea.lines() {
+            for w in extract_words(l) {
+                if w.starts_with(&prefix) && w != prefix && seen.insert(w.to_string()) {
+                    items.push(w.to_string());
+                }
+            }
+        }
+        if items.is_empty() {
+            self.completion = None;
+            return;
+        }
+        items.sort();
+
+        // Try to keep the user's current pick stable across edits — if
+        // the previously-selected word still appears in the list, ride
+        // it along; otherwise reset to the first candidate.
+        let selected = self.completion.as_ref()
+            .and_then(|c| c.items.get(c.selected))
+            .and_then(|cur| items.iter().position(|w| w == cur))
+            .unwrap_or(0);
+        self.completion = Some(CompletionPopup { items, selected, prefix });
+    }
+
+    fn cycle_completion(&mut self, delta: i32) {
+        let Some(comp) = self.completion.as_mut() else { return; };
+        let n = comp.items.len() as i32;
+        if n == 0 { return; }
+        let next = (comp.selected as i32 + delta).rem_euclid(n);
+        comp.selected = next as usize;
+    }
+
+    fn accept_completion(&mut self) {
+        let Some(comp) = self.completion.take() else { return; };
+        let item = &comp.items[comp.selected];
+        // `starts_with(&prefix)` is enforced when we built the list, so
+        // the suffix slice is always at a valid byte boundary.
+        let extra = &item[comp.prefix.len()..];
+        if extra.is_empty() { return; }
+        self.textarea.insert_str(extra);
+        if self.insert_entry.is_some() {
+            self.insert_buffer.push_str(extra);
+        }
+        self.recompute_dirty();
+    }
+
+    /// Esc dismissal hook called from main.rs's global Esc handler so
+    /// the user can close the popup without exiting insert mode.
+    /// Returns `true` when a popup was actually closed.
+    pub fn try_dismiss_completion(&mut self) -> bool {
+        if self.completion.is_some() {
+            self.completion = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove up to one indent step from the start of the current
+    /// line: a leading tab, else up to four leading spaces. Cursor
+    /// column drifts left by however many chars were stripped, which
+    /// matches what most editors do for Shift-Tab in insert mode.
+    fn dedent_current_line(&mut self) {
+        let (row, col) = self.textarea.cursor();
+        let line = self.textarea.lines()[row].clone();
+        let to_strip = if line.starts_with('\t') {
+            1
+        } else {
+            line.chars().take(4).take_while(|c| *c == ' ').count()
+        };
+        if to_strip == 0 { return; }
+        self.textarea.move_cursor(CursorMove::Jump(row as u16, 0));
+        for _ in 0..to_strip {
+            self.textarea.delete_next_char();
+        }
+        // Re-park the cursor where the user logically still is. If the
+        // cursor was inside the stripped indent, clamp to column 0.
+        let new_col = col.saturating_sub(to_strip);
+        self.textarea.move_cursor(CursorMove::Jump(row as u16, new_col as u16));
+    }
+
+    /// `(next_char, prev_char)` around the cursor on the current line.
+    /// Either side is `None` at the line edge.
+    fn surrounding_chars(&self) -> (Option<char>, Option<char>) {
+        let (row, col) = self.textarea.cursor();
+        let line = &self.textarea.lines()[row];
+        let chars: Vec<char> = line.chars().collect();
+        let next = chars.get(col).copied();
+        let prev = if col == 0 { None } else { chars.get(col - 1).copied() };
+        (next, prev)
     }
 
     /// Called by the app when the user leaves insert mode. Rolls the
@@ -1319,6 +1674,22 @@ impl Editor {
         }
     }
 
+    /// Vertical view scroll for mouse-wheel ticks. Positive `delta`
+    /// moves toward the end of the buffer, negative toward the start.
+    /// In nowrap mode this defers to tui-textarea's `scroll`; in wrap
+    /// mode it nudges `scroll_top` directly (the UI layer clamps to
+    /// the document extent and keeps the cursor in view on the next
+    /// draw).
+    pub fn scroll_lines(&mut self, delta: i16) {
+        if !self.wrap {
+            self.textarea.scroll((delta, 0));
+            return;
+        }
+        let top = self.scroll_top.get() as isize;
+        let new_top = (top + delta as isize).max(0) as usize;
+        self.scroll_top.set(new_top);
+    }
+
     /// Horizontal view scroll (vim `zl`/`zh`). Only meaningful in
     /// `nowrap` mode — under soft-wrap there's nothing to scroll
     /// horizontally, so the call is a silent no-op. `delta` is in
@@ -1552,14 +1923,30 @@ impl Editor {
 
     fn open_line_below(&mut self) {
         self.textarea.move_cursor(CursorMove::End);
-        self.textarea.insert_newline();
+        if self.autoindent {
+            self.smart_newline();
+        } else {
+            self.textarea.insert_newline();
+        }
         self.recompute_dirty();
     }
 
     fn open_line_above(&mut self) {
+        // Take the indent from the current line *before* mutating, so
+        // moving up to a still-empty line above doesn't lose it.
+        let (row, _) = self.textarea.cursor();
+        let indent: String = if self.autoindent {
+            self.textarea.lines()[row]
+                .chars().take_while(|c| *c == ' ' || *c == '\t').collect()
+        } else {
+            String::new()
+        };
         self.textarea.move_cursor(CursorMove::Head);
         self.textarea.insert_newline();
         self.textarea.move_cursor(CursorMove::Up);
+        if !indent.is_empty() {
+            self.textarea.insert_str(&indent);
+        }
         self.recompute_dirty();
     }
 
@@ -1711,7 +2098,13 @@ impl Editor {
                 self.run_insert_entry(entry);
                 for ch in text.chars() {
                     if ch == '\n' {
-                        self.textarea.insert_newline();
+                        if self.autoindent {
+                            self.smart_newline();
+                        } else {
+                            self.textarea.insert_newline();
+                        }
+                    } else if self.autopair && is_autopair_char(ch) {
+                        self.type_char_autopair(ch);
                     } else {
                         self.textarea.insert_char(ch);
                     }
@@ -1832,7 +2225,51 @@ pub enum VisualAction {
     ExitEnterInsert,
 }
 
-fn style_textarea(t: &mut TextArea) {
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Pull `[A-Za-z_][A-Za-z0-9_]*`-style identifier tokens out of a line.
+/// Produces borrowed slices so the caller can copy only the unique ones
+/// into the popup index.
+fn extract_words(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Walk forward to the next word start. We use byte indices
+        // (cheap) but only break on ASCII word chars; any non-ASCII
+        // byte is part of a multi-byte char, which is_word_char handles
+        // correctly via the char-iter fallback below.
+        let start_byte = match line[i..].char_indices().find(|(_, c)| is_word_char(*c)) {
+            Some((rel, _)) => i + rel,
+            None => break,
+        };
+        let mut end_byte = start_byte;
+        for (rel, c) in line[start_byte..].char_indices() {
+            if is_word_char(c) {
+                end_byte = start_byte + rel + c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        // Skip pure-numeric tokens — `42` is rarely useful as a
+        // completion target and would clutter the popup in any file
+        // with line numbers, version strings, etc.
+        let tok = &line[start_byte..end_byte];
+        if !tok.chars().next().unwrap_or(' ').is_ascii_digit() {
+            out.push(tok);
+        }
+        i = end_byte;
+    }
+    out
+}
+
+fn is_autopair_char(c: char) -> bool {
+    matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '`')
+}
+
+pub fn style_textarea(t: &mut TextArea) {
     t.set_line_number_style(Style::default().fg(Color::DarkGray));
     t.set_cursor_line_style(Style::default());
 }
