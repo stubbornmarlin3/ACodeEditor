@@ -123,32 +123,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     draw_statusbar(frame, a.statusbar, app);
 
-    // Native terminal cursor only for the focused Shell session —
-    // Claude and the editor render their own. Also skip when the PTY
-    // is scrolled back through history (the live cursor no longer
-    // corresponds to anything visible), or when we're in Normal /
-    // Visual — those modes drive a separate virtual cursor rendered
-    // inside the PTY block.
-    if let FocusId::Cell(i) = app.focus {
-        if let (Some(cell), Some(rect)) = (app.cells.get(i), a.cells.get(i)) {
-            if let Session::Shell(session) = cell.active_session() {
-                if matches!(app.mode, Mode::Insert) {
-                    if let Ok(parser) = session.parser.lock() {
-                        if parser.screen().scrollback() == 0 {
-                            let (cy, cx) = parser.screen().cursor_position();
-                            let x = rect.x.saturating_add(1).saturating_add(cx);
-                            let y = rect.y.saturating_add(1).saturating_add(cy);
-                            let max_x = rect.x + rect.width.saturating_sub(1);
-                            let max_y = rect.y + rect.height.saturating_sub(1);
-                            if x < max_x && y < max_y {
-                                frame.set_cursor_position((x, y));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Shell-cell cursor in Insert mode is drawn as a styled overlay
+    // by `render_pty_into` — we no longer position the native terminal
+    // cursor here. The native cursor would briefly appear at the
+    // previous frame's position whenever a redraw spanned multiple
+    // moves, which read as a flickering cursor jumping around the
+    // screen during chatty output. The drawn overlay sits on the right
+    // cell every frame, no flicker.
 }
 
 fn draw_empty_main(frame: &mut Frame, area: Rect, t: &Theme) {
@@ -1504,6 +1485,26 @@ fn render_pty_into(
     };
     let v_vp = if show_vcursor {
         session.vpos_viewport_row(vcursor).map(|r| (r, vcursor.col))
+    } else if focused
+        && matches!(mode, Mode::Insert)
+        && matches!(cell.active_session(), Session::Shell(_))
+    {
+        // Shell in Insert mode: draw the cursor as an overlay at the
+        // child's real position. The native terminal cursor used to be
+        // moved here via `frame.set_cursor_position`, but it would lag
+        // a frame behind the buffer blit during chatty output and
+        // appear to flicker through whatever was being drawn. The
+        // overlay sits on the right cell every frame.
+        if let Ok(parser) = session.parser.lock() {
+            if parser.screen().scrollback() == 0 {
+                let (cy, cx) = parser.screen().cursor_position();
+                Some((cy, cx))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     } else {
         None
     };

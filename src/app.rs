@@ -1144,6 +1144,21 @@ impl App {
             _ => false,
         };
         if can_insert {
+            // PTY cells: snap the virtual cursor to the child's real
+            // cursor on the way IN to Insert, so the cursor's identity
+            // is anchored to a current live-area row. Without this, an
+            // earlier Normal-mode position can stay pinned to its abs
+            // — and on the way back out (Esc → Normal) any
+            // staleness in `rows_emitted` would show up as the cursor
+            // jumping into history. Doing it here closes the gap before
+            // it has a chance to grow.
+            if let Some(cell) = self.focused_cell_mut() {
+                if let Some(pty) = cell.active_session_mut().as_pty_mut() {
+                    pty.sync_vcursor_to_real();
+                    pty.clear_visual();
+                    pty.pending_g = false;
+                }
+            }
             self.mode = Mode::Insert;
         }
     }
@@ -1177,6 +1192,7 @@ impl App {
         // PTY cells: sync the virtual cursor to the child's real cursor
         // (so Normal-mode motions start where the user was typing) and
         // clear any stale Visual anchor left over from a prior session.
+        let from_insert = matches!(self.mode, Mode::Insert);
         if let Some(cell) = self.focused_cell_mut() {
             match cell.active_session_mut() {
                 Session::Conflict(cv) => {
@@ -1201,10 +1217,17 @@ impl App {
                 Session::Claude(pty) | Session::Shell(pty) => {
                     pty.clear_visual();
                     pty.pending_g = false;
-                    // Always pick up the child's real cursor, not just
-                    // when coming from Insert — Visual→Normal and stray
-                    // Esc paths would otherwise leave vcursor stale.
-                    pty.sync_vcursor_to_real();
+                    // Only re-sync the virtual cursor on Insert→Normal —
+                    // that's the path where the user was typing and the
+                    // child cursor has presumably moved. On Visual→Normal
+                    // the user explicitly placed the vcursor, so snapping
+                    // it back to the live cursor would make it jump to
+                    // the bottom of the screen on every Esc. Insert mode
+                    // already syncs on the way IN, so the value here is
+                    // already up to date for that path too.
+                    if from_insert {
+                        pty.sync_vcursor_to_real();
+                    }
                 }
                 _ => {}
             }

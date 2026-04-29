@@ -1680,14 +1680,25 @@ impl Editor {
     /// mode it nudges `scroll_top` directly (the UI layer clamps to
     /// the document extent and keeps the cursor in view on the next
     /// draw).
+    ///
+    /// Also nudges the cursor by the same delta. Without this,
+    /// tui-textarea's render snaps the viewport back to keep the cursor
+    /// visible, so a wheel tick in Normal/Visual mode would appear to
+    /// do nothing. Moving the cursor with the wheel is also closer to
+    /// what the user expects after a vertical scroll — it stays under
+    /// the same "row in viewport".
     pub fn scroll_lines(&mut self, delta: i16) {
         if !self.wrap {
             self.textarea.scroll((delta, 0));
-            return;
+        } else {
+            let top = self.scroll_top.get() as isize;
+            let new_top = (top + delta as isize).max(0) as usize;
+            self.scroll_top.set(new_top);
         }
-        let top = self.scroll_top.get() as isize;
-        let new_top = (top + delta as isize).max(0) as usize;
-        self.scroll_top.set(new_top);
+        let mv = if delta >= 0 { CursorMove::Down } else { CursorMove::Up };
+        for _ in 0..delta.unsigned_abs() {
+            self.textarea.move_cursor(mv);
+        }
     }
 
     /// Horizontal view scroll (vim `zl`/`zh`). Only meaningful in

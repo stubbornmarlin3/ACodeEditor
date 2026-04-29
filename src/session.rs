@@ -741,31 +741,45 @@ impl PtySession {
         let mut chunk_top = start_abs;
         while chunk_top <= end_abs {
             let chunk_len = (end_abs - chunk_top + 1).min(rows);
-            // Scroll so `chunk_top` sits at viewport row 0.
             let n = self.rows_emitted();
             let scroll = n.saturating_sub(chunk_top) as usize;
-            if let Ok(mut p) = self.parser.lock() {
-                p.set_scrollback(scroll);
-            }
-            let actual = self.scrollback() as u64;
-            let top_vrow_u64 = chunk_top + actual - n;
-            if top_vrow_u64 >= rows { break; }
-            let top_vrow = top_vrow_u64 as u16;
-            let bot_vrow = top_vrow + (chunk_len as u16).saturating_sub(1);
-
             let chunk_bot_abs = chunk_top + chunk_len - 1;
             let is_first_chunk = chunk_top == start_abs;
             let is_last_chunk  = chunk_bot_abs == end_abs;
             let sc = if is_first_chunk { start_col } else { 0 };
             let ec = if is_last_chunk  { end.col.saturating_add(1).min(cols) } else { cols };
 
-            if let Ok(p) = self.parser.lock() {
-                let screen = p.screen();
-                out.push_str(&screen.contents_between(top_vrow, sc, bot_vrow, ec));
-                if !is_last_chunk && !out.ends_with('\n') {
-                    out.push('\n');
+            // Set scrollback AND read the parser-clamped value AND extract
+            // the contents under a single lock. `self.scrollback()` returns
+            // the snapshot's offset, which lags behind the parser by one
+            // reader-thread tick — using it here would compute a wrong
+            // viewport row whenever the snapshot doesn't match the value
+            // we just set, breaking extraction of any chunk past the first
+            // (which is what makes off-screen yank silently truncate).
+            let stop = if let Ok(mut p) = self.parser.lock() {
+                p.set_scrollback(scroll);
+                let actual = p.screen().scrollback() as u64;
+                if chunk_top + actual < n {
+                    true
+                } else {
+                    let top_vrow_u64 = chunk_top + actual - n;
+                    if top_vrow_u64 >= rows {
+                        true
+                    } else {
+                        let top_vrow = top_vrow_u64 as u16;
+                        let bot_vrow = (top_vrow + (chunk_len as u16).saturating_sub(1))
+                            .min((rows as u16).saturating_sub(1));
+                        out.push_str(&p.screen().contents_between(top_vrow, sc, bot_vrow, ec));
+                        if !is_last_chunk && !out.ends_with('\n') {
+                            out.push('\n');
+                        }
+                        false
+                    }
                 }
-            }
+            } else {
+                true
+            };
+            if stop { break; }
 
             chunk_top = chunk_bot_abs + 1;
         }

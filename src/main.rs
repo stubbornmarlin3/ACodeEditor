@@ -370,8 +370,8 @@ fn run(
     // previous iteration. The PTY resize itself is nearly free when all
     // sizes match, but the preceding `ui::layout` walk + iteration over
     // every session still cost something per tick.
-    let mut last_layout_key: (Rect, usize, cell::LayoutMode, bool, bool) = (
-        Rect::default(), usize::MAX, app.layout_mode, app.explorer_hidden, app.explorer_fullscreen,
+    let mut last_layout_key: (Rect, usize, usize, cell::LayoutMode, bool, bool) = (
+        Rect::default(), usize::MAX, usize::MAX, app.layout_mode, app.explorer_hidden, app.explorer_fullscreen,
     );
     while !app.should_quit {
         // Block only as long as the next status message needs to stay
@@ -442,7 +442,13 @@ fn run(
         // Gate on the inputs that could change geometry; the common case
         // is they haven't, and we skip the layout walk entirely.
         let term = current_term_rect();
-        let key = (term, app.cells.len(), app.layout_mode, app.explorer_hidden, app.explorer_fullscreen);
+        // Visible-cell count is included separately: minimizing/restoring a
+        // cell doesn't change `cells.len()`, but it does redistribute screen
+        // space among the remaining visible cells. Without this, PTYs in
+        // those cells stay sized to the pre-minimize layout until some
+        // other key input (e.g. closing a cell) forces a resize.
+        let minimized = app.cells.iter().filter(|c| c.minimized).count();
+        let key = (term, app.cells.len(), minimized, app.layout_mode, app.explorer_hidden, app.explorer_fullscreen);
         if key != last_layout_key {
             resize_ptys_if_needed(app, term);
             last_layout_key = key;
@@ -1101,8 +1107,12 @@ fn handle_pty_normal(app: &mut App, key: KeyEvent) -> PtyAction {
 
     // Paste is tricky to do with the pty borrow held because it
     // reaches into the OS clipboard. Resolve it up front before
-    // taking the &mut borrow.
-    if key.modifiers == M::NONE && key.code == Char('p') {
+    // taking the &mut borrow. `Ctrl+v` is the same paste — the
+    // shortcut most non-vim users expect, mirrored from the
+    // Insert-mode handler so the binding works in either mode.
+    if (key.modifiers == M::NONE && key.code == Char('p'))
+        || (key.modifiers == M::CONTROL && key.code == Char('v'))
+    {
         pty_paste_from_clipboard(app);
         return PtyAction::Consumed;
     }
@@ -2007,6 +2017,17 @@ fn handle_insert(app: &mut App, key: KeyEvent) {
             KeyCode::PageDown => { pty_scroll_focused(app, -delta); return; }
             _ => {}
         }
+    }
+
+    // Ctrl+v in a PTY pastes from the OS clipboard, matching `p` in
+    // Normal mode. Otherwise key_to_bytes would forward it as the raw
+    // 0x16 control byte and the shell would treat it as "literal next
+    // char", which is almost never what the user wants.
+    if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('v')
+        && app.focused_pty_mut().is_some()
+    {
+        pty_paste_from_clipboard(app);
+        return;
     }
 
     let bytes = match key_to_bytes(key) {
