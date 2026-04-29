@@ -619,6 +619,13 @@ impl App {
                 return;
             }
         }
+        // No matching repo — the passive tick discovered a workdir we
+        // don't yet know about. Happens when a `.git` folder appears
+        // externally (e.g. another tool runs `git init`, a clone lands
+        // alongside us, a submodule is added). Fall through to a full
+        // rediscovery so the new repo gets installed with branches +
+        // statuses populated, instead of silently dropping the update.
+        self.refresh_git();
     }
 
     /// Clamp branch / change cursors after a snapshot swap so stale

@@ -538,8 +538,16 @@ impl Editor {
             self.external_conflict = Some(ExternalConflict::ModifiedOnDisk);
             ReconcileOutcome::ConflictMarked
         } else {
+            // Preserve cursor position across the reload so the user
+            // doesn't snap back to the top of the file every time disk
+            // changes (e.g. `git pull`, formatter-on-save in another
+            // tool). Clamp to the new line/column extents.
+            let (cur_row, cur_col) = self.textarea.cursor();
             self.textarea = TextArea::new(disk_lines.clone());
             style_textarea(&mut self.textarea);
+            let new_row = cur_row.min(disk_lines.len().saturating_sub(1));
+            let new_col = cur_col.min(disk_lines.get(new_row).map_or(0, |l| l.chars().count()));
+            self.textarea.move_cursor(CursorMove::Jump(new_row as u16, new_col as u16));
             self.saved_lines = disk_lines;
             self.saved_hash  = disk_hash;
             self.saved_mtime = disk_mtime;
@@ -1677,24 +1685,12 @@ impl Editor {
     /// Vertical view scroll for mouse-wheel ticks. Positive `delta`
     /// moves toward the end of the buffer, negative toward the start.
     /// In nowrap mode this defers to tui-textarea's `scroll`; in wrap
-    /// mode it nudges `scroll_top` directly (the UI layer clamps to
-    /// the document extent and keeps the cursor in view on the next
-    /// draw).
-    ///
-    /// Also nudges the cursor by the same delta. Without this,
-    /// tui-textarea's render snaps the viewport back to keep the cursor
-    /// visible, so a wheel tick in Normal/Visual mode would appear to
-    /// do nothing. Moving the cursor with the wheel is also closer to
-    /// what the user expects after a vertical scroll — it stays under
-    /// the same "row in viewport".
+    /// Wheel-tick handler. The mouse wheel behaves like repeated j/k —
+    /// it moves the cursor, and the viewport only follows when the
+    /// cursor would otherwise leave the visible area. This matches what
+    /// users expect from a terminal/modal editor more closely than a
+    /// "scroll the viewport, drag the cursor along" model.
     pub fn scroll_lines(&mut self, delta: i16) {
-        if !self.wrap {
-            self.textarea.scroll((delta, 0));
-        } else {
-            let top = self.scroll_top.get() as isize;
-            let new_top = (top + delta as isize).max(0) as usize;
-            self.scroll_top.set(new_top);
-        }
         let mv = if delta >= 0 { CursorMove::Down } else { CursorMove::Up };
         for _ in 0..delta.unsigned_abs() {
             self.textarea.move_cursor(mv);
